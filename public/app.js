@@ -65,6 +65,7 @@ const routes = [
   [/^#\/account$/, viewAccount],
   [/^#\/admin\/users$/, viewUsers, false, true],
   [/^#\/admin\/audit$/, viewAudit, false, true],
+  [/^#\/admin\/settings$/, viewSettings, false, true],
 ];
 
 async function route() {
@@ -107,7 +108,7 @@ function renderChrome(hash) {
   document.title = site;
   $('#who-name').textContent = state.me.user.displayName || state.me.user.username;
   const links = [['#/', 'Dashboard'], ['#/catalog', 'Catalog'], ['#/labs', isAdmin() ? 'All labs' : 'My labs'], ['#/jobs', 'Activity']];
-  if (isAdmin()) links.push(['#/admin/users', 'Users'], ['#/admin/audit', 'Audit log']);
+  if (isAdmin()) links.push(['#/admin/users', 'Users'], ['#/admin/audit', 'Audit log'], ['#/admin/settings', 'Settings']);
   if (state.me.user.mustChangePassword) links.length = 0;
   $('#nav').replaceChildren(...links.map(([href, label]) => {
     const active = href === '#/' ? (hash === '#/' || hash === '') : hash.startsWith(href);
@@ -233,12 +234,14 @@ function inventoryNotice(inv) {
 
 // ---------- views ----------
 async function viewLogin() {
+  const siteLine = h('p', {}, 'Lab Portal');
+  api('/api/site', { allow401: true }).then((s) => { siteLine.textContent = s.name; document.title = s.name; }).catch(() => {});
   const user = h('input', { type: 'text', autocomplete: 'username', required: true, autofocus: true });
   const pass = h('input', { type: 'password', autocomplete: 'current-password', required: true });
   const err = h('div', { class: 'error-text' });
   const btn = h('button', { class: 'btn primary', type: 'submit', style: 'width:100%' }, 'Sign in');
   const form = h('form', { class: 'card auth-card' },
-    h('h1', {}, 'Sign in'), h('p', {}, 'Lab Portal'),
+    h('h1', {}, 'Sign in'), siteLine,
     h('label', { class: 'field' }, h('span', {}, 'Username'), user),
     h('label', { class: 'field' }, h('span', {}, 'Password'), pass),
     err, btn);
@@ -674,6 +677,24 @@ function editUser(u, templates) {
   }
   buttons.push(h('button', { class: 'btn', onclick: () => d.close() }, 'Cancel'), h('button', { class: 'btn primary', onclick: save }, isNew ? 'Create user' : 'Save'));
   const d = dialog(isNew ? 'New user' : `Edit ${u.username}`, body, buttons);
+}
+
+async function viewSettings() {
+  const cfg = await api('/api/settings');
+  const name = h('input', { type: 'text', maxlength: 60, value: cfg.siteName, placeholder: cfg.defaultSiteName });
+  const form = h('form', { class: 'card pad', style: 'max-width:560px' },
+    h('label', { class: 'field' }, h('span', {}, 'Portal name'), name),
+    h('p', { class: 'muted' }, `Shown in the top-left corner, the browser tab and the sign-in page. Leave it blank to use the name from config.json (${cfg.defaultSiteName}).`),
+    h('button', { class: 'btn primary', type: 'submit' }, 'Save'));
+  form.addEventListener('submit', async (ev) => {
+    ev.preventDefault();
+    try {
+      const r = await api('/api/settings', { method: 'PUT', body: { siteName: name.value } });
+      state.me.site.name = r.siteName; name.value = r.siteName;
+      renderChrome(location.hash); toast('Saved');
+    } catch (e) { toast(e.message, true); }
+  });
+  render(pageHead('Settings', 'Portal-wide settings. Changes apply immediately for everyone.'), form);
 }
 
 async function viewAudit() {

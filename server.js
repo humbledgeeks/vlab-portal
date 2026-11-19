@@ -6,7 +6,7 @@ const path = require('node:path');
 const crypto = require('node:crypto');
 const express = require('express');
 const config = require('./lib/config');
-const { db, audit } = require('./lib/db');
+const { db, audit, getSetting, setSetting } = require('./lib/db');
 const auth = require('./lib/auth');
 const vlab = require('./lib/vlab');
 const jobs = require('./lib/jobs');
@@ -80,11 +80,18 @@ app.post('/api/login', (req, res) => {
 
 app.post('/api/logout', (req, res) => { auth.destroySession(req, res); res.json({ ok: true }); });
 
+// Portal name: set by an admin on the Settings page, else config.json's site.name
+const defaultSiteName = () => config.site.name || 'vLab Portal';
+const siteName = () => getSetting('site.name') || defaultSiteName();
+
+// public: the sign-in page shows the portal name too
+app.get('/api/site', (req, res) => res.json({ name: siteName() }));
+
 app.get('/api/me', auth.requireUser, (req, res) => {
   res.json({
     user: { id: req.user.id, username: req.user.username, displayName: req.user.display_name, role: req.user.role,
       maxLabs: req.user.max_labs, mustChangePassword: !!req.user.must_change_password },
-    site: { name: config.site.name || 'vLab Portal', guacamole: guac.enabled(), maxSnapshotsPerLab: config.labs.maxSnapshotsPerLab },
+    site: { name: siteName(), guacamole: guac.enabled(), maxSnapshotsPerLab: config.labs.maxSnapshotsPerLab },
   });
 });
 
@@ -280,6 +287,20 @@ app.get('/api/jobs/:id', auth.requireUser, (req, res) => {
   if (!j || (!isAdmin(req) && j.user_id !== req.user.id)) return res.status(404).json({ error: 'No such job.' });
   delete j.args;
   res.json(j);
+});
+
+// ---- admin: portal settings ----------------------------------------------------------------
+app.get('/api/settings', auth.requireUser, auth.requireAdmin, (req, res) => {
+  res.json({ siteName: siteName(), defaultSiteName: defaultSiteName() });
+});
+
+app.put('/api/settings', auth.requireUser, auth.requireAdmin, (req, res) => {
+  const name = String((req.body || {}).siteName ?? '').replace(/[\u0000-\u001f\u007f]/g, '').trim();
+  if (name.length > 60) return res.status(400).json({ error: 'Keep the portal name to 60 characters or fewer.' });
+  const before = siteName();
+  setSetting('site.name', name === defaultSiteName() ? '' : name);   // blank or the default = use config.json
+  audit(req, 'settings.siteName', null, { from: before, to: siteName() });
+  res.json({ siteName: siteName() });
 });
 
 // ---- admin: catalog maintenance -----------------------------------------------------------

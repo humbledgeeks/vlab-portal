@@ -232,6 +232,7 @@ Next, add lab templates (see [Lab templates](#lab-templates)). The catalog stays
   | Disable | removes the template vApp from vCenter; the volume, snapshots and port groups are kept |
   | Start / Shut down / Power off template | power the template's VMs on or off, e.g. to update the template itself |
 * **Catalog → template name** opens the template's page: status, gateway IP, its VMs (power state, IP, guest OS, vCPU/RAM), diagram and job history. While the template is running, **Connect** (on the card and the page) opens its jumphost desktop, e.g. to update the template.
+* **Settings**: rename the portal (top-left, browser tab and sign-in page). Takes effect at once; blank goes back to `site.name` from `config.json`.
 * **Refresh status** re-reads vCenter and ONTAP now instead of within 60 seconds.
 * **Audit log**: every sign-in, failed sign-in, provision, power action, snapshot, restore, connect and user change, with the source IP.
 
@@ -285,7 +286,7 @@ Once everyone uses the new portal:
 | `inventoryIntervalSec` | `60` | how often status is re-read from vCenter and ONTAP |
 | `maxConcurrentJobs` | `2` | jobs that may run at the same time; each lab runs one at a time |
 | `secureCookies` | `false` | `true` when users reach the portal through HTTPS (reverse proxy) |
-| `site.name` | `vLab Portal` | title in the browser |
+| `site.name` | `vLab Portal` | portal name in the browser; admins can override it under **Settings** without a restart |
 | `vcenter.server`, `.cluster`, `.vswitch`, `.wanPortgroup`, `.vlanBase` | | see the greenfield table |
 | `ontap.cluster`, `.svm`, `.datastore` | | see the greenfield table |
 | `ontap.junctionRoot` | `/<datastore>` | set only if lab volumes are junctioned somewhere else |
