@@ -103,7 +103,7 @@ Optional, but do it first so the portal installer can take the URL and key. You 
 On the Linux host, as a normal user:
 
 ```bash
-git clone <this-repo-url> vlab-portal
+git clone https://github.com/humbledgeeks/vlab-portal.git vlab-portal
 cd vlab-portal/guacamole
 ./install-guacamole.sh            # optional: a port other than 8085, e.g. ./install-guacamole.sh 9085
 ```
@@ -129,7 +129,7 @@ The script runs Guacamole 1.6.0 with **only** encrypted-JSON login, so there is 
 Sign in to the Windows server as the account that should run the portal, then:
 
 ```powershell
-git clone <this-repo-url> C:\vlab-portal          # or download the ZIP and extract it to C:\vlab-portal
+git clone https://github.com/humbledgeeks/vlab-portal.git C:\vlab-portal          # or download the ZIP and extract it to C:\vlab-portal
 ```
 
 Use a path **without spaces**. Then open **Windows PowerShell as Administrator**:
