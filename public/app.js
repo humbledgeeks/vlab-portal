@@ -556,20 +556,24 @@ async function viewJobs() {
 async function viewJob(id) {
   const pre = h('pre', { class: 'log' });
   const head = h('div');
-  const render = async () => {
+  // admins also see template jobs; those link to the template page, not a lab copy
+  const templates = isAdmin() ? new Set((await loadInventory()).templates.map((t) => t.name)) : new Set();
+  const refresh = async () => {
     const j = await api(`/api/jobs/${id}`);
     head.replaceChildren(pageHead(`${jobLabel(j.action)} · ${j.target}`,
       `Job #${j.id}${j.username ? ` by ${j.username}` : ''} · started ${when(j.started_at || j.created_at)}`,
-      jobPill(j.status), h('a', { class: 'btn', href: `#/labs/${encodeURIComponent(j.target)}` }, 'Open lab')));
+      jobPill(j.status), templates.has(j.target)
+        ? h('a', { class: 'btn', href: `#/catalog/${encodeURIComponent(j.target)}` }, 'Open template')
+        : h('a', { class: 'btn', href: `#/labs/${encodeURIComponent(j.target)}` }, 'Open lab')));
     const atBottom = pre.scrollTop + pre.clientHeight >= pre.scrollHeight - 20;
     pre.textContent = j.log || '(waiting to start…)';
     if (atBottom) pre.scrollTop = pre.scrollHeight;
     return j.status === 'queued' || j.status === 'running';
   };
-  const live = await render();
+  const live = await refresh();
   render(head, h('div', { class: 'card' }, h('div', { class: 'card pad', style: 'border:0;box-shadow:none' }, h('b', {}, 'Output')), pre));
   pre.scrollTop = pre.scrollHeight;
-  if (live) every(2000, async () => { if (location.hash === `#/jobs/${id}` && !(await render())) clearTimers(); });
+  if (live) every(2000, async () => { if (location.hash === `#/jobs/${id}` && !(await refresh())) clearTimers(); });
 }
 
 async function viewAccount() {
