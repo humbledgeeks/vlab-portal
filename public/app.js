@@ -46,7 +46,9 @@ const state = { me: null, inv: null, timers: [] };
 const isAdmin = () => state.me && state.me.user.role === 'admin';
 
 function go(hash) { if (location.hash !== hash) location.hash = hash; else route(); }
-function every(ms, fn) { state.timers.push(setInterval(fn, ms)); }
+// Views register their auto-refresh with every(). A soft refresh re-runs the view function,
+// so every() must not add another timer then (otherwise timers double on each refresh).
+function every(ms, fn) { if (state.softRefreshing !== state.navId) state.timers.push(setInterval(fn, ms)); }
 function clearTimers() { state.timers.forEach(clearInterval); state.timers = []; }
 
 const routes = [
@@ -64,6 +66,8 @@ const routes = [
 
 async function route() {
   clearTimers();
+  state.navId = (state.navId || 0) + 1;
+  state.softRefreshing = null;
   document.querySelectorAll('dialog[open]').forEach((d) => d.close());
   const hash = location.hash || '#/';
   if (!state.me && hash !== '#/login') {
@@ -276,10 +280,12 @@ async function viewDashboard() {
 
 // re-render without flashing "Loading…" and without stealing focus from open dialogs
 async function softRefresh(fn) {
-  if (document.querySelector('dialog[open]')) return;
+  if (document.querySelector('dialog[open]') || state.softRefreshing || document.hidden) return;
   const y = window.scrollY;
-  const keep = view().cloneNode(true);
-  try { await fn(); window.scrollTo(0, y); } catch { view().replaceChildren(...keep.childNodes); }
+  const keep = Array.from(view().childNodes);
+  state.softRefreshing = state.navId;   // marks "this page is refreshing itself"
+  try { await fn(); window.scrollTo(0, y); } catch { view().replaceChildren(...keep); }
+  finally { state.softRefreshing = null; }
 }
 
 function labsTable(labs, compact) {
