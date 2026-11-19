@@ -322,6 +322,7 @@ Stop-ScheduledTask 'vLab Portal'; Start-ScheduledTask 'vLab Portal'
 | Page doesn't load from another PC | Windows Firewall: `Get-NetFirewallRule -Name vLabPortal-*` |
 | "Reading lab status…" for several minutes, or an admin sees an inventory error | read `logs\portal.log`. Usually vCenter or ONTAP is unreachable or the credentials changed: delete `data\*.cred.xml` and re-run `.\install.ps1` **as the portal account** |
 | "Key not valid for use in specified state" | the credential files were saved by another Windows account or on another machine; same fix as above |
+| Installer stops at the credentials step, or says "must be trusted for delegation" | you're connected over SSH with a key (or another logon without a password), and Windows can't decrypt saved credentials without one. Run `install.ps1` from an RDP or console session. The installed portal is unaffected, since its boot task stores the password |
 | Provision fails with "Template … is not enabled" | the template has no vApp; use **Manage… → Enable (import)** |
 | Provision fails with "Port group … already exists … with VMs attached" | a VM somewhere still uses a port group with the new copy's name; find it in vCenter and move or remove it |
 | Restore fails "Snapshot … not found" | it was already removed, either deleted or by restoring an older snapshot. Refresh the page |
