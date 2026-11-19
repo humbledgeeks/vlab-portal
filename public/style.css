@@ -123,10 +123,12 @@ label.field > span { display: block; font-size: 13px; font-weight: 600; color: v
 .grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(290px, 1fr)); gap: 16px; }
 .lab-card { display: flex; flex-direction: column; overflow: hidden; }
 .lab-card .thumb {
-  height: 150px; background: var(--surface-2); border-bottom: 1px solid var(--border);
+  aspect-ratio: 16 / 9; background: #fff; border-bottom: 1px solid var(--border);
   display: flex; align-items: center; justify-content: center; overflow: hidden;
 }
-.lab-card .thumb img { width: 100%; height: 100%; object-fit: cover; object-position: top; }
+/* show the whole diagram (scaled down), never crop it */
+.lab-card .thumb img { width: 100%; height: 100%; object-fit: contain; padding: 6px; box-sizing: border-box; }
+.lab-card .thumb:has(.placeholder) { background: var(--surface-2); }
 .lab-card .thumb .placeholder { color: var(--muted); font-size: 13px; }
 .lab-card .body { padding: 14px 16px; flex: 1; display: flex; flex-direction: column; gap: 6px; }
 .lab-card .title { font-weight: 650; display: flex; align-items: center; justify-content: space-between; gap: 8px; }
