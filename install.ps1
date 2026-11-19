@@ -193,11 +193,11 @@ if (-not $SkipCredentials) {
         $ok = $false
         if (Test-Path $c.File) {
             try { $null = Import-Clixml $c.File; $ok = $true; Info "Using saved credentials for $($c.What)" }
-            catch { Warn "Saved credentials for $($c.What) belong to another Windows account." }
+            catch { Warn "Can't read saved credentials for $($c.What): $($_.Exception.Message)" }
         }
         if (-not $ok -and $mode -eq 'brownfield' -and (Test-Path $c.Legacy)) {
             try { $cred = Import-Clixml $c.Legacy; $cred | Export-Clixml $c.File; $ok = $true; Info "Imported vlab 1.x credentials for $($c.What)" }
-            catch { Warn "vlab 1.x credentials for $($c.What) were saved by another account; enter them again." }
+            catch { Warn "Can't read vlab 1.x credentials for $($c.What): $($_.Exception.Message)"; Warn 'Run the installer from a normal (RDP/console) logon as the account that saved them, or enter them again below.' }
         }
         if (-not $ok) {
             $cred = Get-Credential -Message "Credentials for $($c.What)"
