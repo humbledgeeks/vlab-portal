@@ -1,0 +1,11 @@
+{
+  "port": 8090,
+  "vlabRoot": "C:\\vlab",
+  "inventoryIntervalSec": 60,
+  "maxConcurrentJobs": 2,
+  "secureCookies": false,
+  "guacamole": {
+    "url": "http://<guacamole-host>:8085/guacamole",
+    "jsonSecretKey": "<JSON_SECRET_KEY from ~/guacamole/guacamole.env on the RHEL9 host>"
+  }
+}
