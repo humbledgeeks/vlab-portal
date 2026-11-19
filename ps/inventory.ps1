@@ -11,7 +11,11 @@ foreach ($a in @(Get-VApp | Where-Object { $_.Name -like 'lab_*' })) {
     $gw = $vms | Where-Object { $_.Name -like '*gateway*' } | Select-Object -First 1
     $ip = $null
     if ($gw -and $gw.Guest.IPAddress) { $ip = @($gw.Guest.IPAddress | Where-Object { $_ -match '^\d+\.\d+\.\d+\.\d+$' })[0] }
-    $vapps[$a.Name] = @{ status = "$($a.Status)"; gatewayIp = $ip; vmCount = $vms.Count }
+    $list = @($vms | Sort-Object Name | ForEach-Object {
+        @{ name = $_.Name; power = "$($_.PowerState)"; os = "$($_.Guest.OSFullName)"; cpu = $_.NumCpu; memGB = [math]::Round($_.MemoryGB, 1)
+           ip = @($_.Guest.IPAddress | Where-Object { $_ -match '^\d+\.\d+\.\d+\.\d+$' }) -join ', ' }
+    })
+    $vapps[$a.Name] = @{ status = "$($a.Status)"; gatewayIp = $ip; vmCount = $vms.Count; vms = $list }
 }
 
 $templates = @(); $instances = @()
@@ -51,4 +55,4 @@ $capacity = @{
     diskTotalGB = [math]::Round(($aggrs | Measure-Object TotalSize -Sum).Sum / 1GB)
     diskFreeGB  = [math]::Round(($aggrs | Measure-Object Available -Sum).Sum / 1GB)
 }
-[pscustomobject]@{ templates = $templates; instances = $instances; capacity = $capacity } | ConvertTo-Json -Depth 6 -Compress
+[pscustomobject]@{ templates = $templates; instances = $instances; capacity = $capacity } | ConvertTo-Json -Depth 8 -Compress

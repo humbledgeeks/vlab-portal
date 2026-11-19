@@ -57,6 +57,7 @@ const routes = [
   [/^#\/login$/, viewLogin, true],
   [/^#\/?$/, viewDashboard],
   [/^#\/catalog$/, viewCatalog],
+  [/^#\/catalog\/([\w.-]+)$/, viewTemplate, false, true],
   [/^#\/labs$/, viewLabs],
   [/^#\/labs\/([\w.-]+)$/, viewLab],
   [/^#\/jobs$/, viewJobs],
@@ -196,22 +197,25 @@ async function labAction(lab, action) {
     route();
   } catch (e) { toast(e.message, true); }
 }
-async function connect(lab) {
+async function connect(lab, isTemplate) {
   // open the tab synchronously (popup blockers), then point it at Guacamole
   const win = window.open('', '_blank');
   try {
-    const { url } = await api(`/api/labs/${encodeURIComponent(lab.name)}/connect`);
+    const { url } = await api(`/api/${isTemplate ? 'catalog' : 'labs'}/${encodeURIComponent(lab.name)}/connect`);
     if (win) { win.opener = null; win.location = url; } else location.href = url;
   } catch (e) { if (win) win.close(); toast(e.message, true); }
+}
+function connectButton(lab, compact, isTemplate) {
+  return h('button', { class: 'btn primary' + (compact ? ' small' : ''), disabled: !!lab.job || !state.me.site.guacamole || !lab.gatewayIp,
+    title: !state.me.site.guacamole ? 'Remote desktop not configured' : (!lab.gatewayIp ? 'Gateway has no address yet' : 'Open the lab desktop'),
+    onclick: () => connect(lab, isTemplate) }, 'Connect');
 }
 function labButtons(lab, compact) {
   const cls = 'btn' + (compact ? ' small' : '');
   const busy = !!lab.job || lab.status === 'Provisioning';
   const running = lab.status === 'Started';
   return [
-    running ? h('button', { class: cls + ' primary', disabled: busy || !state.me.site.guacamole || !lab.gatewayIp,
-      title: !state.me.site.guacamole ? 'Remote desktop not configured' : (!lab.gatewayIp ? 'Gateway has no address yet' : 'Open the lab desktop'),
-      onclick: () => connect(lab) }, 'Connect') : null,
+    running ? connectButton(lab, compact, false) : null,
     !running ? h('button', { class: cls, disabled: busy, onclick: () => labAction(lab, 'start') }, 'Start') : null,
     running ? h('button', { class: cls, disabled: busy, onclick: () => labAction(lab, 'stop') }, 'Shut down') : null,
     running ? h('button', { class: cls + ' danger', disabled: busy, onclick: () => labAction(lab, 'kill') }, 'Power off') : null,
@@ -326,11 +330,13 @@ async function viewCatalog() {
     const busy = !!t.job;
     const foot = [h('button', { class: 'btn primary', disabled: quotaFull || (admin && t.status === 'Disabled'),
       title: quotaFull ? `You're at your limit of ${inv.quota.max} lab(s)` : '', onclick: () => provision(t) }, 'Get a copy')];
+    if (admin && t.status === 'Started') foot.push(connectButton(t, true, true));
     if (admin) foot.push(templateMenu(t));
     return h('div', { class: 'card lab-card' },
       h('div', { class: 'thumb' }, diagram(t.name, t.hasDiagram)),
       h('div', { class: 'body' },
-        h('div', { class: 'title' }, h('span', {}, t.name), admin ? statusPill(t.status, t.job) : null),
+        h('div', { class: 'title' }, admin ? h('a', { class: 'lab-name', href: `#/catalog/${encodeURIComponent(t.name)}` }, t.name) : h('span', {}, t.name),
+          admin ? statusPill(t.status, t.job) : null),
         h('div', { class: 'desc' }, t.description || 'No description yet.'),
         admin && busy ? h('a', { class: 'lab-sub', href: `#/jobs/${t.job.id}` }, 'view progress') : null),
       h('div', { class: 'foot' }, foot));
@@ -357,6 +363,7 @@ function templateMenu(t) {
   const sel = h('select', { style: 'width:auto;flex:1', disabled: !!t.job, onchange: async () => {
     const action = sel.value; sel.value = '';
     if (action === 'describe') return editDescription(t);
+    if (action === 'diagram') return uploadDiagram(t);
     const text = { enable: 'Register the template VMs in vCenter (as a vApp) so the template can be started, edited and copied.',
       disable: 'Remove the template vApp from vCenter. The ONTAP volume, its snapshots and port groups are kept; Enable brings it back.',
       snapshot: "Take a new 'master' snapshot (the previous one is kept, renamed). New copies start from this point; existing copies are not affected.",
@@ -366,10 +373,60 @@ function templateMenu(t) {
     catch (e) { toast(e.message, true); }
   } },
   h('option', { value: '' }, 'Manage…'),
-  [['describe', 'Edit description'], ['snapshot', 'New master snapshot'], ['enable', 'Enable (import)'], ['disable', 'Disable'],
+  [['describe', 'Edit description'], ['diagram', t.hasDiagram ? 'Replace diagram' : 'Upload diagram'], ['snapshot', 'New master snapshot'], ['enable', 'Enable (import)'], ['disable', 'Disable'],
     ['start', 'Start template'], ['stop', 'Shut down template'], ['kill', 'Power off template']]
     .map(([v, l]) => h('option', { value: v }, l)));
   return sel;
+}
+
+// admin: one catalog template, its state and the VMs inside it
+async function viewTemplate(name) {
+  const inv = await loadInventory();
+  const t = inv.templates.find((x) => x.name === name);
+  if (!t) { render(errorBox('Template not found.')); return; }
+  const jobs = await api(`/api/jobs?target=${encodeURIComponent(name)}&limit=20`);
+  const running = t.status === 'Started';
+  const rows = t.vms.map((vm) => h('tr', {},
+    h('td', {}, h('div', { class: 'lab-name' }, vm.name), vm.os ? h('div', { class: 'lab-sub' }, vm.os) : null),
+    h('td', {}, statusPill(vm.power === 'PoweredOn' ? 'Started' : 'Stopped')),
+    h('td', { class: 'mono' }, vm.ip || '—'),
+    h('td', {}, `${vm.cpu} vCPU · ${vm.memGB} GB`)));
+  render(
+    pageHead(t.name, t.description || 'Catalog template', running ? connectButton(t, false, true) : null, templateMenu(t)),
+    inventoryNotice(inv),
+    h('div', { class: 'tiles' },
+      h('div', { class: 'card tile' }, h('div', { class: 'label' }, 'Status'), h('div', { style: 'margin-top:8px' }, statusPill(t.status, t.job))),
+      h('div', { class: 'card tile' }, h('div', { class: 'label' }, 'Gateway (WAN)'), h('div', { class: 'value mono', style: 'font-size:20px' }, t.gatewayIp || '—')),
+      h('div', { class: 'card tile' }, h('div', { class: 'label' }, 'Virtual machines'), h('div', { class: 'value' }, String(t.vms.length))),
+      h('div', { class: 'card tile' }, h('div', { class: 'label' }, 'Volume size'), h('div', { class: 'value' }, t.sizeGB != null ? `${t.sizeGB} GB` : '—'))),
+    h('div', { class: 'section' }, h('h2', {}, 'Virtual machines'),
+      t.vms.length ? h('div', { class: 'card table-wrap' }, h('table', {},
+        h('thead', {}, h('tr', {}, h('th', {}, 'VM'), h('th', {}, 'Power'), h('th', {}, 'IP address'), h('th', {}, 'Size'))),
+        h('tbody', {}, rows)))
+        : h('div', { class: 'card empty' }, h('p', {}, t.status === 'Disabled' ? 'This template is not enabled in vCenter. Use Manage → Enable to import its VMs.' : 'No VMs found.'))),
+    t.hasDiagram ? h('div', { class: 'section card', style: 'overflow:hidden' }, h('img', { src: `/api/diagram/${encodeURIComponent(t.name)}`, alt: 'Lab topology', style: 'width:100%;display:block' })) : null,
+    h('div', { class: 'section' }, h('h2', {}, 'History'), jobsTable(jobs)));
+  every(10000, () => { if (location.hash === `#/catalog/${encodeURIComponent(name)}` || location.hash === `#/catalog/${name}`) softRefresh(() => viewTemplate(name)); });
+}
+
+function uploadDiagram(t) {
+  const file = h('input', { type: 'file', accept: 'image/png,image/jpeg' });
+  const d = dialog(`Diagram: ${t.name}`, h('div', {},
+    h('label', { class: 'field' }, h('span', {}, 'PNG or JPEG, up to 10 MB'), file),
+    h('p', { class: 'muted' }, t.hasDiagram ? 'This replaces the current diagram. ' : '', 'It shows on the catalog card and on every copy of this lab.')), [
+    h('button', { class: 'btn', onclick: () => d.close() }, 'Cancel'),
+    h('button', { class: 'btn primary', onclick: async () => {
+      const f = file.files[0];
+      if (!f) return toast('Choose an image first.', true);
+      if (f.size > 10 * 1024 * 1024) return toast('That image is larger than 10 MB.', true);
+      try {
+        const res = await fetch(`/api/catalog/${encodeURIComponent(t.name)}/diagram`, { method: 'PUT', credentials: 'same-origin',
+          headers: { 'Content-Type': f.type === 'image/png' ? 'image/png' : 'image/jpeg', 'X-Requested-With': 'vlab-portal' }, body: f });
+        const data = await res.json().catch(() => ({}));
+        if (!res.ok) throw new Error(data.error || `Upload failed (${res.status})`);
+        d.close(); toast('Diagram saved'); route();
+      } catch (e) { toast(e.message, true); }
+    } }, 'Upload')]);
 }
 
 function editDescription(t) {

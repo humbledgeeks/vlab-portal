@@ -226,10 +226,12 @@ Next, add lab templates (see [Lab templates](#lab-templates)). The catalog stays
   | Item | What it does |
   |---|---|
   | Edit description | text on the catalog card (stored in `catalog\descriptions.tbl`) |
+  | Upload / Replace diagram | PNG or JPEG (up to 10 MB) shown on the catalog card and on every copy of the template (stored as `catalog\<template>.png` or `.jpg`) |
   | New master snapshot | snapshot `master` of the template (the previous one is kept, renamed `master.<date>`); new copies start from it, existing copies are unaffected |
   | Enable (import) | mounts the template volume if needed, creates its vApp and registers its VMs |
   | Disable | removes the template vApp from vCenter; the volume, snapshots and port groups are kept |
   | Start / Shut down / Power off template | power the template's VMs on or off, e.g. to update the template itself |
+* **Catalog → template name** opens the template's page: status, gateway IP, its VMs (power state, IP, guest OS, vCPU/RAM), diagram and job history. While the template is running, **Connect** (on the card and the page) opens its jumphost desktop, e.g. to update the template.
 * **Refresh status** re-reads vCenter and ONTAP now instead of within 60 seconds.
 * **Audit log**: every sign-in, failed sign-in, provision, power action, snapshot, restore, connect and user change, with the source IP.
 

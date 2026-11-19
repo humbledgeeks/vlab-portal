@@ -111,7 +111,8 @@ app.get('/api/inventory', auth.requireUser, (req, res) => {
 
   const templates = inv.templates.filter((t) => granted.has(t.name)).map((t) => ({
     name: t.name, description: desc[t.name] || '', hasDiagram: !!vlab.diagramPath(t.name),
-    ...(admin ? { status: t.vapp ? t.vapp.status : 'Disabled', sizeGB: t.sizeGB, job: activeJobs.get(t.name) || null } : {}),
+    ...(admin ? { status: t.vapp ? t.vapp.status : 'Disabled', sizeGB: t.sizeGB, job: activeJobs.get(t.name) || null,
+      gatewayIp: t.vapp ? t.vapp.gatewayIp : null, vms: t.vapp ? (t.vapp.vms || []) : [] } : {}),
   }));
 
   const instByName = new Map(inv.instances.map((i) => [i.name, i]));
@@ -147,7 +148,7 @@ app.post('/api/inventory/refresh', auth.requireUser, auth.requireAdmin, (req, re
 app.get('/api/diagram/:template', auth.requireUser, (req, res) => {
   const p = vlab.diagramPath(req.params.template);
   if (!p) return res.status(404).end();
-  res.set('Cache-Control', 'private, max-age=3600');
+  res.set('Cache-Control', 'private, no-cache');   // revalidate (ETag) so an uploaded diagram shows at once
   res.sendFile(p);
 });
 
@@ -190,15 +191,20 @@ app.get('/api/labs/:name/connect', auth.requireUser, (req, res) => {
   if (!row) return res.status(404).json({ error: 'No such lab.' });
   if (!guac.enabled()) return res.status(503).json({ error: 'Remote desktop is not configured yet.' });
   const inst = vlab.inventory().instances.find((i) => i.name === name);
+  sendConnectUrl(req, res, inst, name, row.template);
+});
+
+// Guacamole link to a running lab (copy or template) through its gateway's WAN address.
+function sendConnectUrl(req, res, inst, name, template) {
   if (!inst || !inst.vapp || inst.vapp.status !== 'Started') return res.status(409).json({ error: 'Start the lab first.' });
   if (!inst.vapp.gatewayIp) return res.status(409).json({ error: 'The lab gateway has no address yet. Try again in a minute.' });
   const url = guac.connectUrl({
     username: req.user.username, connectionName: name, hostname: inst.vapp.gatewayIp,
-    rdp: vlab.rdpCredentials(row.template),
+    rdp: vlab.rdpCredentials(template),
   });
   audit(req, 'lab.connect', name);
   res.json({ url });
-});
+}
 
 // ---- lab snapshots (per lab copy, on its FlexClone volume) ------------------------------
 // The clone's inherited base snapshot is the "original" (state when the copy was made);
@@ -277,6 +283,14 @@ app.get('/api/jobs/:id', auth.requireUser, (req, res) => {
 });
 
 // ---- admin: catalog maintenance -----------------------------------------------------------
+app.get('/api/catalog/:template/connect', auth.requireUser, auth.requireAdmin, (req, res) => {
+  const t = req.params.template;
+  if (!guac.enabled()) return res.status(503).json({ error: 'Remote desktop is not configured yet.' });
+  const inst = vlab.isLabName(t) && vlab.inventory().templates.find((x) => x.name === t);
+  if (!inst) return res.status(404).json({ error: 'No such catalog lab.' });
+  sendConnectUrl(req, res, inst, t, t);
+});
+
 // UI action -> engine action for catalog templates
 const TEMPLATE_ACTIONS = { enable: 'template-enable', disable: 'template-disable', snapshot: 'template-master', start: 'start', stop: 'stop', kill: 'kill' };
 app.post('/api/catalog/:template/:action', auth.requireUser, auth.requireAdmin, (req, res) => {
@@ -289,6 +303,16 @@ app.post('/api/catalog/:template/:action', auth.requireUser, auth.requireAdmin, 
     res.json({ ok: true, jobId: id });
   } catch (e) { res.status(e.status || 500).json({ error: e.message }); }
 });
+
+app.put('/api/catalog/:template/diagram', auth.requireUser, auth.requireAdmin,
+  express.raw({ type: ['image/png', 'image/jpeg'], limit: '10mb' }), (req, res) => {
+    const t = req.params.template;
+    if (!vlab.isLabName(t) || !vlab.inventory().templates.some((x) => x.name === t)) return res.status(404).json({ error: 'No such catalog lab.' });
+    if (!Buffer.isBuffer(req.body) || !req.body.length) return res.status(400).json({ error: 'Choose a PNG or JPEG image.' });
+    try { vlab.setDiagram(t, req.body); } catch (e) { return res.status(e.status || 500).json({ error: e.message }); }
+    audit(req, 'template.diagram', t, { bytes: req.body.length });
+    res.json({ ok: true });
+  });
 
 app.put('/api/catalog/:template/description', auth.requireUser, auth.requireAdmin, (req, res) => {
   const t = req.params.template;
