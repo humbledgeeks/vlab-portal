@@ -5,8 +5,10 @@ $ErrorActionPreference = 'Stop'
 $root = 'C:\vlab-portal'
 $cred = Get-Credential -UserName "$env:USERDOMAIN\$env:USERNAME" -Message 'Windows password for the account that will run the portal'
 
+# No quotes: cmd /c strips the first and last quote on the line, which breaks quoted paths.
+# (C:\vlab-portal has no spaces, so none are needed.)
 $action = New-ScheduledTaskAction -Execute 'cmd.exe' -WorkingDirectory $root `
-  -Argument "/c `"$root\runtime\node\node.exe`" server.js >> `"$root\logs\portal.log`" 2>&1"
+  -Argument "/c $root\runtime\node\node.exe server.js >> $root\logs\portal.log 2>&1"
 $trigger = New-ScheduledTaskTrigger -AtStartup
 $settings = New-ScheduledTaskSettingsSet -ExecutionTimeLimit ([TimeSpan]::Zero) -StartWhenAvailable `
   -RestartCount 999 -RestartInterval (New-TimeSpan -Minutes 1) -MultipleInstances IgnoreNew
