@@ -1,11 +1,12 @@
 {
   "port": 8090,
-  "vlabRoot": "C:\\vlab",
   "inventoryIntervalSec": 60,
   "maxConcurrentJobs": 2,
   "secureCookies": false,
-  "guacamole": {
-    "url": "http://<guacamole-host>:8085/guacamole",
-    "jsonSecretKey": "<JSON_SECRET_KEY printed by guacamole/install-guacamole.sh>"
-  }
+  "site": { "name": "vLab Portal" },
+  "vcenter": { "server": "vcsa.lab.local", "cluster": "Lab-Cluster", "vswitch": "vSwitch0", "wanPortgroup": "VM Network", "vlanBase": 1000 },
+  "ontap": { "cluster": "10.0.0.30", "svm": "svm_labs", "datastore": "LABs", "junctionRoot": "" },
+  "labs": { "firstId": 1000, "autostart": false, "maxSnapshotsPerLab": 5 },
+  "rdp": { "domain": "lab", "user": "administrator", "password": "<default jumphost password>" },
+  "guacamole": { "url": "http://<guacamole-host>:8085/guacamole", "jsonSecretKey": "<32 hex chars from guacamole/install-guacamole.sh>" }
 }

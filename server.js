@@ -1,5 +1,5 @@
 'use strict';
-// vLab Portal: web front end + API for Sean's vlab scripts (C:\vlab), with local user accounts.
+// vLab Portal: multi-user web portal for FlexClone-based lab copies on vSphere + ONTAP.
 process.chdir(__dirname);
 const fs = require('node:fs');
 const path = require('node:path');
@@ -81,11 +81,10 @@ app.post('/api/login', (req, res) => {
 app.post('/api/logout', (req, res) => { auth.destroySession(req, res); res.json({ ok: true }); });
 
 app.get('/api/me', auth.requireUser, (req, res) => {
-  const s = vlab.settings();
   res.json({
     user: { id: req.user.id, username: req.user.username, displayName: req.user.display_name, role: req.user.role,
       maxLabs: req.user.max_labs, mustChangePassword: !!req.user.must_change_password },
-    site: { name: s.sitename || 'vLab Portal', guacamole: guac.enabled() },
+    site: { name: config.site.name || 'vLab Portal', guacamole: guac.enabled(), maxSnapshotsPerLab: config.labs.maxSnapshotsPerLab },
   });
 });
 
@@ -128,6 +127,7 @@ app.get('/api/inventory', auth.requireUser, (req, res) => {
       sizeGB: i ? i.sizeGB : null, hasDiagram: !!vlab.diagramPath(r.template),
       owner: owner ? { id: owner.id, username: owner.username } : null,
       job: activeJobs.get(r.name) || null,
+      snapshots: i ? snapshotsOf(i) : [],
     };
   });
 
@@ -163,7 +163,7 @@ app.post('/api/catalog/:template/provision', auth.requireUser, (req, res) => {
   const name = vlab.nextInstanceName(t);
   db.prepare('INSERT INTO labs (name, template, owner_id) VALUES (?,?,?)').run(name, t, req.user.id);
   try {
-    const id = jobs.enqueue(req.user.id, 'provision', name, [t, name]);
+    const id = jobs.enqueue(req.user.id, 'provision', name, { lab: name, template: t });
     audit(req, 'lab.provision', name, { template: t, job: id });
     res.json({ ok: true, name, jobId: id });
   } catch (e) {
@@ -172,13 +172,13 @@ app.post('/api/catalog/:template/provision', auth.requireUser, (req, res) => {
   }
 });
 
-app.post('/api/labs/:name/:action', auth.requireUser, (req, res) => {
+app.post('/api/labs/:name/:action', auth.requireUser, (req, res, next) => {
   const { name, action } = req.params;
-  if (!['start', 'stop', 'kill', 'destroy'].includes(action)) return res.status(404).json({ error: 'Unknown action.' });
+  if (!['start', 'stop', 'kill', 'destroy'].includes(action)) return next();   // e.g. /snapshots has its own route
   if (!vlab.isLabName(name) || !canUseLab(req, name)) return res.status(404).json({ error: 'No such lab.' });
   if (!vlab.inventory().instances.some((i) => i.name === name)) return res.status(409).json({ error: 'This lab is not ready yet.' });
   try {
-    const id = jobs.enqueue(req.user.id, action, name, [name]);
+    const id = jobs.enqueue(req.user.id, action, name, { lab: name });
     audit(req, `lab.${action}`, name, { job: id });
     res.json({ ok: true, jobId: id });
   } catch (e) { res.status(e.status || 500).json({ error: e.message }); }
@@ -198,6 +198,62 @@ app.get('/api/labs/:name/connect', auth.requireUser, (req, res) => {
   });
   audit(req, 'lab.connect', name);
   res.json({ url });
+});
+
+// ---- lab snapshots (per lab copy, on its FlexClone volume) ------------------------------
+// The clone's inherited base snapshot is the "original" (state when the copy was made);
+// portal snapshots are named vlab_<UTC timestamp> and carry the user's label as the ONTAP comment.
+function snapshotsOf(inst) {
+  return (inst.snapshots || []).map((s) => ({
+    name: s.name, created: s.created, label: s.name === inst.baseSnapshot ? 'Original (as deployed)' : (s.comment || ''),
+    sizeMB: s.sizeMB, original: s.name === inst.baseSnapshot,
+  })).sort((a, b) => (a.original ? -1 : b.original ? 1 : String(b.created).localeCompare(String(a.created))));
+}
+
+function labForSnapshots(req, res) {
+  const { name } = req.params;
+  if (!vlab.isLabName(name) || !canUseLab(req, name)) { res.status(404).json({ error: 'No such lab.' }); return null; }
+  const inst = vlab.inventory().instances.find((i) => i.name === name);
+  if (!inst) { res.status(409).json({ error: 'This lab is not ready yet.' }); return null; }
+  return inst;
+}
+
+app.post('/api/labs/:name/snapshots', auth.requireUser, (req, res) => {
+  const inst = labForSnapshots(req, res); if (!inst) return;
+  const own = snapshotsOf(inst).filter((s) => !s.original).length;
+  if (own >= config.labs.maxSnapshotsPerLab) {
+    return res.status(409).json({ error: `This lab already has ${config.labs.maxSnapshotsPerLab} snapshots, the limit. Delete one first.` });
+  }
+  const label = String((req.body || {}).label || '').replace(/[\r\n]+/g, ' ').trim().slice(0, 120);
+  const snapshot = 'vlab_' + new Date().toISOString().replace(/[-:]/g, '').replace(/\.\d+Z$/, 'Z');
+  try {
+    const id = jobs.enqueue(req.user.id, 'lab-snapshot', inst.name, { lab: inst.name, snapshot, label: label || 'Snapshot', maxSnapshots: config.labs.maxSnapshotsPerLab });
+    audit(req, 'lab.snapshot', inst.name, { snapshot, label, job: id });
+    res.json({ ok: true, jobId: id, snapshot });
+  } catch (e) { res.status(e.status || 500).json({ error: e.message }); }
+});
+
+app.post('/api/labs/:name/snapshots/:snap/restore', auth.requireUser, (req, res) => {
+  const inst = labForSnapshots(req, res); if (!inst) return;
+  const snap = snapshotsOf(inst).find((s) => s.name === req.params.snap);
+  if (!snap) return res.status(404).json({ error: 'No such snapshot.' });
+  try {
+    const id = jobs.enqueue(req.user.id, 'lab-restore', inst.name, { lab: inst.name, template: inst.parent, snapshot: snap.name });
+    audit(req, 'lab.restore', inst.name, { snapshot: snap.name, original: snap.original, job: id });
+    res.json({ ok: true, jobId: id });
+  } catch (e) { res.status(e.status || 500).json({ error: e.message }); }
+});
+
+app.delete('/api/labs/:name/snapshots/:snap', auth.requireUser, (req, res) => {
+  const inst = labForSnapshots(req, res); if (!inst) return;
+  const snap = snapshotsOf(inst).find((s) => s.name === req.params.snap);
+  if (!snap) return res.status(404).json({ error: 'No such snapshot.' });
+  if (snap.original) return res.status(400).json({ error: 'The original snapshot cannot be deleted.' });
+  try {
+    const id = jobs.enqueue(req.user.id, 'lab-snapdelete', inst.name, { lab: inst.name, snapshot: snap.name });
+    audit(req, 'lab.snapshot-delete', inst.name, { snapshot: snap.name, job: id });
+    res.json({ ok: true, jobId: id });
+  } catch (e) { res.status(e.status || 500).json({ error: e.message }); }
 });
 
 // ---- jobs --------------------------------------------------------------------------------
@@ -221,13 +277,14 @@ app.get('/api/jobs/:id', auth.requireUser, (req, res) => {
 });
 
 // ---- admin: catalog maintenance -----------------------------------------------------------
-const TEMPLATE_ACTIONS = ['enable', 'disable', 'snapshot', 'mount', 'unmount', 'start', 'stop', 'kill'];
+// UI action -> engine action for catalog templates
+const TEMPLATE_ACTIONS = { enable: 'template-enable', disable: 'template-disable', snapshot: 'template-master', start: 'start', stop: 'stop', kill: 'kill' };
 app.post('/api/catalog/:template/:action', auth.requireUser, auth.requireAdmin, (req, res) => {
   const { template: t, action } = req.params;
-  if (!TEMPLATE_ACTIONS.includes(action)) return res.status(404).json({ error: 'Unknown action.' });
+  if (!Object.hasOwn(TEMPLATE_ACTIONS, action)) return res.status(404).json({ error: 'Unknown action.' });
   if (!vlab.isLabName(t) || !vlab.inventory().templates.some((x) => x.name === t)) return res.status(404).json({ error: 'No such catalog lab.' });
   try {
-    const id = jobs.enqueue(req.user.id, action, t, [t]);
+    const id = jobs.enqueue(req.user.id, TEMPLATE_ACTIONS[action], t, { lab: t });
     audit(req, `template.${action}`, t, { job: id });
     res.json({ ok: true, jobId: id });
   } catch (e) { res.status(e.status || 500).json({ error: e.message }); }
@@ -350,4 +407,4 @@ app.use((err, req, res, _next) => {
 
 jobs.setOnFinished(() => vlab.runInventory());
 vlab.startPolling();
-app.listen(config.port, () => console.log(`[portal] listening on http://0.0.0.0:${config.port} (vlab scripts: ${config.vlabRoot})`));
+app.listen(config.port, () => console.log(`[portal] listening on http://0.0.0.0:${config.port} (vCenter ${config.vcenter.server}, ONTAP ${config.ontap.cluster}/${config.ontap.svm})`));

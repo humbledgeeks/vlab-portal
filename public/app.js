@@ -18,6 +18,8 @@ function h(tag, attrs, ...children) {
 }
 const $ = (sel) => document.querySelector(sel);
 const view = () => $('#view');
+// replaceChildren() would print null/false as text; drop them (views pass optional blocks)
+const render = (...nodes) => view().replaceChildren(...nodes.flat().filter((x) => x != null && x !== false));
 
 function toast(msg, bad) {
   const t = h('div', { class: 'toast' + (bad ? ' bad' : '') }, msg);
@@ -80,8 +82,8 @@ async function route() {
     if (!m) continue;
     if (!open && !state.me) return go('#/login');
     if (adminOnly && !isAdmin()) return go('#/');
-    view().replaceChildren(h('div', { class: 'muted' }, 'Loading…'));
-    try { await fn(...m.slice(1)); } catch (e) { view().replaceChildren(errorBox(e.message)); }
+    render(h('div', { class: 'muted' }, 'Loading…'));
+    try { await fn(...m.slice(1)); } catch (e) { render(errorBox(e.message)); }
     return;
   }
   go('#/');
@@ -127,7 +129,8 @@ function statusPill(status, job) {
   return h('span', { class: 'pill ' + cls }, label);
 }
 const JOB_LABELS = { provision: 'Provisioning', start: 'Starting', stop: 'Shutting down', kill: 'Powering off', destroy: 'Destroying',
-  enable: 'Enabling', disable: 'Disabling', snapshot: 'Snapshotting', mount: 'Mounting', unmount: 'Unmounting' };
+  'lab-snapshot': 'Taking snapshot', 'lab-restore': 'Restoring', 'lab-snapdelete': 'Deleting snapshot',
+  'template-enable': 'Enabling', 'template-disable': 'Disabling', 'template-master': 'Snapshotting template' };
 const jobLabel = (a) => JOB_LABELS[a] || a;
 function jobPill(status) {
   const cls = { succeeded: 'ok', failed: 'bad', running: 'warn busy', queued: 'idle' }[status] || 'idle';
@@ -212,6 +215,7 @@ function labButtons(lab, compact) {
     !running ? h('button', { class: cls, disabled: busy, onclick: () => labAction(lab, 'start') }, 'Start') : null,
     running ? h('button', { class: cls, disabled: busy, onclick: () => labAction(lab, 'stop') }, 'Shut down') : null,
     running ? h('button', { class: cls + ' danger', disabled: busy, onclick: () => labAction(lab, 'kill') }, 'Power off') : null,
+    compact ? h('a', { class: cls, href: `#/labs/${encodeURIComponent(lab.name)}` }, 'Snapshots') : null,
     h('button', { class: cls + ' danger', disabled: busy, onclick: () => labAction(lab, 'destroy') }, 'Destroy'),
   ];
 }
@@ -242,7 +246,7 @@ async function viewLogin() {
       go(r.mustChangePassword ? '#/account' : '#/');
     } catch (e) { err.textContent = e.message; btn.disabled = false; pass.select(); }
   });
-  view().replaceChildren(h('div', { class: 'auth-wrap' }, form));
+  render(h('div', { class: 'auth-wrap' }, form));
 }
 
 async function viewDashboard() {
@@ -265,7 +269,7 @@ async function viewDashboard() {
       tile('Lab storage', `${Math.round((c.diskTotalGB - c.diskFreeGB) / 1024)} / ${Math.round(c.diskTotalGB / 1024)} TB`, null, meter(c.diskTotalGB - c.diskFreeGB, c.diskTotalGB)));
   }
   const jobs = await api('/api/jobs?limit=8');
-  view().replaceChildren(
+  render(
     pageHead(`Welcome, ${state.me.user.displayName || state.me.user.username}`, inv.updatedAt ? `Status updated ${when(inv.updatedAt.replace('T', ' ').replace(/\..*/, ''))}` : null,
       h('a', { class: 'btn primary', href: '#/catalog' }, 'Browse catalog')),
     inventoryNotice(inv),
@@ -331,7 +335,7 @@ async function viewCatalog() {
         admin && busy ? h('a', { class: 'lab-sub', href: `#/jobs/${t.job.id}` }, 'view progress') : null),
       h('div', { class: 'foot' }, foot));
   });
-  view().replaceChildren(
+  render(
     pageHead('Catalog', admin ? 'Lab templates. Users only see the ones you grant them.'
       : `Labs you can launch. You are using ${inv.quota.used} of ${inv.quota.max} lab slot(s).`,
     admin ? h('button', { class: 'btn', onclick: async () => { await api('/api/inventory/refresh', { method: 'POST' }); toast('Refreshing status…'); } }, 'Refresh status') : null),
@@ -353,19 +357,17 @@ function templateMenu(t) {
   const sel = h('select', { style: 'width:auto;flex:1', disabled: !!t.job, onchange: async () => {
     const action = sel.value; sel.value = '';
     if (action === 'describe') return editDescription(t);
-    const text = { enable: 'Import the template VMs into vCenter so it can be started and copied.',
-      disable: 'Remove the template vApp from vCenter (the ONTAP volume and its snapshots are kept).',
-      snapshot: "Take a new 'master' snapshot. New copies will start from this point.",
-      mount: 'Mount the template datastore for editing (authoring mode).',
-      unmount: 'Leave authoring mode and re-import the VMs from the lab datastore.',
-      start: 'Power on the template VMs.', stop: 'Shut down the template VMs.', kill: 'Hard power-off the template VMs.' }[action];
+    const text = { enable: 'Register the template VMs in vCenter (as a vApp) so the template can be started, edited and copied.',
+      disable: 'Remove the template vApp from vCenter. The ONTAP volume, its snapshots and port groups are kept; Enable brings it back.',
+      snapshot: "Take a new 'master' snapshot (the previous one is kept, renamed). New copies start from this point; existing copies are not affected.",
+      start: 'Power on the template VMs, e.g. to edit the template.', stop: 'Shut down the template VMs.', kill: 'Hard power-off the template VMs.' }[action];
     if (!await confirmBox(`${sel.querySelector(`option[value=${action}]`).textContent}: ${t.name}`, text, 'Run', ['disable', 'kill'].includes(action))) return;
     try { const r = await api(`/api/catalog/${encodeURIComponent(t.name)}/${action}`, { method: 'POST' }); toast(`Queued job #${r.jobId}`); route(); }
     catch (e) { toast(e.message, true); }
   } },
   h('option', { value: '' }, 'Manage…'),
-  [['describe', 'Edit description'], ['snapshot', 'Snapshot'], ['enable', 'Enable (import)'], ['disable', 'Disable'],
-    ['mount', 'Mount for authoring'], ['unmount', 'Unmount authoring'], ['start', 'Start template'], ['stop', 'Shut down template'], ['kill', 'Power off template']]
+  [['describe', 'Edit description'], ['snapshot', 'New master snapshot'], ['enable', 'Enable (import)'], ['disable', 'Disable'],
+    ['start', 'Start template'], ['stop', 'Shut down template'], ['kill', 'Power off template']]
     .map(([v, l]) => h('option', { value: v }, l)));
   return sel;
 }
@@ -383,7 +385,7 @@ function editDescription(t) {
 async function viewLabs() {
   if (isAdmin()) usersCache = await api('/api/users');
   const inv = await loadInventory();
-  view().replaceChildren(
+  render(
     pageHead(isAdmin() ? 'All lab copies' : 'My labs',
       isAdmin() ? 'Every provisioned copy. Assign an owner to hand a lab to a user.' : `${inv.quota.used} of ${inv.quota.max} lab slot(s) used.`,
       h('a', { class: 'btn primary', href: '#/catalog' }, 'Get another lab')),
@@ -396,9 +398,9 @@ async function viewLabs() {
 async function viewLab(name) {
   const inv = await loadInventory();
   const lab = inv.labs.find((l) => l.name === name);
-  if (!lab) { view().replaceChildren(errorBox('Lab not found, or you do not have access to it.')); return; }
+  if (!lab) { render(errorBox('Lab not found, or you do not have access to it.')); return; }
   const jobs = await api(`/api/jobs?target=${encodeURIComponent(name)}&limit=20`);
-  view().replaceChildren(
+  render(
     pageHead(lab.name, lab.description || `Copy of ${lab.template}`, ...labButtons(lab, false)),
     inventoryNotice(inv),
     h('div', { class: 'tiles' },
@@ -407,9 +409,72 @@ async function viewLab(name) {
       h('div', { class: 'card tile' }, h('div', { class: 'label' }, 'Virtual machines'), h('div', { class: 'value' }, String(lab.vmCount || 0))),
       h('div', { class: 'card tile' }, h('div', { class: 'label' }, 'Template'), h('div', { class: 'value', style: 'font-size:18px' }, lab.template),
         isAdmin() ? h('div', { class: 'sub' }, lab.owner ? `owner: ${lab.owner.username}` : 'unassigned') : null)),
-    lab.hasDiagram ? h('div', { class: 'card', style: 'overflow:hidden' }, h('img', { src: `/api/diagram/${encodeURIComponent(lab.template)}`, alt: 'Lab topology', style: 'width:100%;display:block' })) : null,
+    snapshotsSection(lab),
+    lab.hasDiagram ? h('div', { class: 'section card', style: 'overflow:hidden' }, h('img', { src: `/api/diagram/${encodeURIComponent(lab.template)}`, alt: 'Lab topology', style: 'width:100%;display:block' })) : null,
     h('div', { class: 'section' }, h('h2', {}, 'History'), jobsTable(jobs)));
   every(10000, () => { if (location.hash === `#/labs/${encodeURIComponent(name)}` || location.hash === `#/labs/${name}`) softRefresh(() => viewLab(name)); });
+}
+
+// ---------- lab snapshots ----------
+function snapshotsSection(lab) {
+  const max = state.me.site.maxSnapshotsPerLab;
+  const own = lab.snapshots.filter((x) => !x.original);
+  const busy = !!lab.job || lab.status === 'Provisioning';
+  const take = h('button', { class: 'btn primary small', disabled: busy || own.length >= max,
+    title: own.length >= max ? `Limit of ${max} reached; delete one first` : '', onclick: () => takeSnapshot(lab) }, 'Take snapshot');
+  const rows = lab.snapshots.map((x) => h('tr', {},
+    h('td', {}, h('div', { class: 'lab-name' }, x.label || 'Snapshot'), h('div', { class: 'lab-sub mono' }, x.name)),
+    h('td', { class: 'muted' }, x.created ? new Date(x.created).toLocaleString() : ''),
+    h('td', {}, h('div', { class: 'actions' },
+      h('button', { class: 'btn small', disabled: busy, onclick: () => restoreSnapshot(lab, x) }, x.original ? 'Reset to original' : 'Restore'),
+      x.original ? null : h('button', { class: 'btn small danger', disabled: busy, onclick: () => deleteSnapshot(lab, x) }, 'Delete')))));
+  return h('div', { class: 'section' },
+    h('div', { class: 'page-head', style: 'margin-bottom:12px' },
+      h('div', {}, h('h2', { style: 'margin:0' }, 'Snapshots'),
+        h('p', { class: 'muted', style: 'margin:2px 0 0' }, `Save this lab's state and roll back to it. ${own.length} of ${max} used; the original is always kept.`)),
+      take),
+    h('div', { class: 'card table-wrap' }, h('table', {},
+      h('thead', {}, h('tr', {}, h('th', {}, 'Snapshot'), h('th', {}, 'Taken'), h('th', {}, ''))),
+      h('tbody', {}, rows))));
+}
+
+async function takeSnapshot(lab) {
+  const label = h('input', { type: 'text', maxlength: 120, placeholder: 'e.g. Before upgrading ONTAP' });
+  const running = lab.status === 'Started';
+  const go_ = async () => {
+    try {
+      const r = await api(`/api/labs/${encodeURIComponent(lab.name)}/snapshots`, { method: 'POST', body: { label: label.value } });
+      d.close(); toast(`Snapshot queued (job #${r.jobId})`); route();
+    } catch (e) { toast(e.message, true); }
+  };
+  const d = dialog(`Snapshot ${lab.name}`, h('div', {},
+    h('label', { class: 'field' }, h('span', {}, 'Name for this snapshot'), label),
+    running ? h('div', { class: 'notice' }, "The lab is running. The snapshot is taken instantly but is crash-consistent, like pulling the power plug. For a clean snapshot, shut the lab down first.") : null,
+    h('p', { class: 'muted' }, 'Only this lab copy is affected. The catalog template and other people\'s labs are not touched.')),
+  [h('button', { class: 'btn', onclick: () => d.close() }, 'Cancel'), h('button', { class: 'btn primary', onclick: go_ }, 'Take snapshot')]);
+  label.focus();
+}
+
+async function restoreSnapshot(lab, snap) {
+  const newer = lab.snapshots.filter((x) => !x.original && x.created > snap.created).length;
+  const msg = (snap.original
+    ? `Reset ${lab.name} to exactly how it was when it was created. Everything changed since then is lost.`
+    : `Roll ${lab.name} back to "${snap.label || snap.name}". Everything changed since then is lost.`)
+    + ' The lab is powered off first and stays off afterwards.'
+    + (newer ? ` ${newer} newer snapshot(s) will be deleted too (ONTAP removes snapshots taken after the one you restore).` : '');
+  if (!await confirmBox(snap.original ? 'Reset to original' : 'Restore snapshot', msg, snap.original ? 'Reset lab' : 'Restore', true, lab.name)) return;
+  try {
+    const r = await api(`/api/labs/${encodeURIComponent(lab.name)}/snapshots/${encodeURIComponent(snap.name)}/restore`, { method: 'POST' });
+    toast('Restore queued'); go(`#/jobs/${r.jobId}`);
+  } catch (e) { toast(e.message, true); }
+}
+
+async function deleteSnapshot(lab, snap) {
+  if (!await confirmBox('Delete snapshot', `Delete "${snap.label || snap.name}" from ${lab.name}? The lab itself is not changed.`, 'Delete', true)) return;
+  try {
+    await api(`/api/labs/${encodeURIComponent(lab.name)}/snapshots/${encodeURIComponent(snap.name)}`, { method: 'DELETE' });
+    toast('Delete queued'); route();
+  } catch (e) { toast(e.message, true); }
 }
 
 function jobsTable(jobs) {
@@ -427,7 +492,7 @@ function jobsTable(jobs) {
 
 async function viewJobs() {
   const jobs = await api('/api/jobs?limit=100');
-  view().replaceChildren(pageHead('Activity', isAdmin() ? 'Every provisioning and power job.' : 'Your provisioning and power jobs.'), jobsTable(jobs));
+  render(pageHead('Activity', isAdmin() ? 'Every provisioning and power job.' : 'Your provisioning and power jobs.'), jobsTable(jobs));
   every(10000, () => { if (location.hash === '#/jobs') softRefresh(viewJobs); });
 }
 
@@ -445,7 +510,7 @@ async function viewJob(id) {
     return j.status === 'queued' || j.status === 'running';
   };
   const live = await render();
-  view().replaceChildren(head, h('div', { class: 'card' }, h('div', { class: 'card pad', style: 'border:0;box-shadow:none' }, h('b', {}, 'Output')), pre));
+  render(head, h('div', { class: 'card' }, h('div', { class: 'card pad', style: 'border:0;box-shadow:none' }, h('b', {}, 'Output')), pre));
   pre.scrollTop = pre.scrollHeight;
   if (live) every(2000, async () => { if (location.hash === `#/jobs/${id}` && !(await render())) clearTimers(); });
 }
@@ -473,13 +538,13 @@ async function viewAccount() {
       go('#/');
     } catch (e) { err.textContent = e.message; }
   });
-  view().replaceChildren(h('div', { class: 'auth-wrap' }, form));
+  render(h('div', { class: 'auth-wrap' }, form));
 }
 
 async function viewUsers() {
   const [users, inv] = await Promise.all([api('/api/users'), loadInventory()]);
   const templates = inv.templates.map((t) => t.name);
-  view().replaceChildren(
+  render(
     pageHead('Users', 'Create accounts, choose which catalog labs each person can launch, and how many copies they may hold.',
       h('button', { class: 'btn primary', onclick: () => editUser(null, templates) }, 'New user')),
     h('div', { class: 'card table-wrap' }, h('table', {},
@@ -552,7 +617,7 @@ function editUser(u, templates) {
 
 async function viewAudit() {
   const rows = await api('/api/audit?limit=300');
-  view().replaceChildren(pageHead('Audit log', 'Sign-ins and every change made through the portal.'),
+  render(pageHead('Audit log', 'Sign-ins and every change made through the portal.'),
     h('div', { class: 'card table-wrap' }, h('table', {},
       h('thead', {}, h('tr', {}, h('th', {}, 'When'), h('th', {}, 'User'), h('th', {}, 'Action'), h('th', {}, 'Target'), h('th', {}, 'From'), h('th', {}, 'Detail'))),
       h('tbody', {}, rows.map((r) => h('tr', {},

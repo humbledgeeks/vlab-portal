@@ -1,141 +1,170 @@
 <#
 .SYNOPSIS
-    Installs vLab Portal (vLab 2.0) on a Windows Server.
+    Installs vLab Portal (vLab 2.0) on a Windows Server. Self-contained: does not need vlab 1.x.
 
 .DESCRIPTION
-    Works for both kinds of site:
+    GREENFIELD  - nothing installed yet. The installer asks for your vCenter / ONTAP settings and
+                  credentials (like vlab 1.x's install), installs the VCF.PowerCLI and NetApp.ONTAP
+                  PowerShell modules, and sets everything up.
 
-    BROWNFIELD  - madlabber/vlab is already installed (default C:\vlab with settings.cfg and
-                  the saved vicred/nccred.clixml). The portal reuses it as-is: same settings,
-                  same saved credentials, same lab templates and lab copies. The legacy portal
-                  on port 8081 keeps working until you retire it.
-
-    GREENFIELD  - no vlab yet. The installer downloads madlabber/vlab (pinned commit) into
-                  C:\vlab, asks for your vCenter / ONTAP settings, installs the PowerCLI and
-                  NetApp.ONTAP modules and saves the credentials.
+    BROWNFIELD  - vlab 1.x is installed (default C:\vlab, detected by its settings.cfg). The installer
+                  imports its settings, its saved vCenter/ONTAP credentials, lab descriptions, diagrams
+                  and per-lab RDP overrides, once. Existing lab templates and lab copies show up in the
+                  portal automatically. vlab 1.x itself is left untouched and keeps working.
 
     Then, in both cases it:
-      * downloads a private Node.js 24 LTS runtime into .\runtime (checksum verified;
-        nothing is installed system-wide, an existing Node.js is not touched)
+      * downloads a private Node.js 24 LTS runtime into .\runtime (checksum verified; nothing is
+        installed system-wide, an existing Node.js is not touched)
       * installs the portal's one npm dependency (express)
-      * writes config.json (port, vlab path, optional Guacamole remote-desktop settings)
-      * enables PowerShell remoting on localhost if needed (vlab's scripts use it)
+      * writes config.json and saves credentials in .\data (encrypted for this Windows account)
       * opens the portal port in Windows Firewall
       * registers a scheduled task "vLab Portal" that starts the portal at boot as YOU
 
-    Run it from an elevated PowerShell, logged on as the account the portal should run as.
-    That account must be the one that owns vlab's saved credentials (clixml files are
-    encrypted for one Windows user only).
+    Run from an elevated Windows PowerShell, signed in as the account the portal should run as.
+    Safe to re-run: existing settings, credentials and users are kept.
 
 .EXAMPLE
     .\install.ps1
-    Interactive install. Detects brownfield/greenfield by looking for C:\vlab\settings.cfg.
-
 .EXAMPLE
     .\install.ps1 -GuacamoleUrl http://10.0.0.5:8085/guacamole -GuacamoleKey 0123456789abcdef0123456789abcdef
-    Same, and enables the Connect (browser remote desktop) button.
+.EXAMPLE
+    .\install.ps1 -LegacyVlabRoot D:\vlab        # brownfield with vlab 1.x somewhere else
 #>
 [CmdletBinding()]
 param(
-    [string]$VlabRoot = 'C:\vlab',
+    [string]$LegacyVlabRoot = 'C:\vlab',
     [int]$Port = 8090,
     [string]$GuacamoleUrl = '',
     [string]$GuacamoleKey = '',
     [string]$NodeVersion = 'v24.22.3',
-    [string]$VlabRepo = 'madlabber/vlab',
-    [string]$VlabCommit = 'da460da10e8e8e6ac516439310334bacc049f385',
     [switch]$SkipService,        # don't register the scheduled task (e.g. to test)
     [switch]$SkipCredentials,    # don't prompt for vCenter/ONTAP credentials
-    [string]$SettingsFile = ''   # greenfield, unattended: JSON file with settings.cfg values
+    [switch]$Greenfield,         # ignore a legacy vlab even if one is found
+    [string]$SettingsFile = ''   # greenfield, unattended: JSON file with the settings (see README)
 )
 
 $ErrorActionPreference = 'Stop'
-$ProgressPreference = 'SilentlyContinue'   # Invoke-WebRequest is very slow with the progress bar
+$ProgressPreference = 'SilentlyContinue'
 [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
 $PortalRoot = $PSScriptRoot
+$DataDir = Join-Path $PortalRoot 'data'
+$CatalogDir = Join-Path $PortalRoot 'catalog'
+$CfgPath = Join-Path $PortalRoot 'config.json'
 
 function Step($text) { Write-Host ''; Write-Host "==> $text" -ForegroundColor Cyan }
 function Info($text) { Write-Host "    $text" }
 function Warn($text) { Write-Host "    ! $text" -ForegroundColor Yellow }
 function Ask($prompt, $default) {
-    $suffix = ''; if ($default) { $suffix = " [$default]" }
+    $suffix = ''; if ("$default") { $suffix = " [$default]" }
     $answer = Read-Host "    $prompt$suffix"
-    if ([string]::IsNullOrWhiteSpace($answer)) { return $default }
+    if ([string]::IsNullOrWhiteSpace($answer)) { return "$default" }
     return $answer.Trim()
 }
+function AskRequired($prompt, $default) { do { $v = Ask $prompt $default } while ([string]::IsNullOrWhiteSpace($v)); return $v }
+function ReadKV($file) {
+    $h = @{}
+    foreach ($line in Get-Content $file) {
+        $i = $line.IndexOf('='); if ($i -gt 0) { $h[$line.Substring(0, $i).Trim()] = $line.Substring($i + 1).Trim() }
+    }
+    return $h
+}
+function Lock-Down($path) {
+    # only this account, SYSTEM and Administrators
+    & icacls $path /inheritance:r /grant "$($identity.Name):(OI)(CI)F" /grant '*S-1-5-18:(OI)(CI)F' /grant '*S-1-5-32-544:(OI)(CI)F' | Out-Null
+}
 
-# ---------------------------------------------------------------------------------- checks
+# ------------------------------------------------------------------------------- checks
 Step 'Checking prerequisites'
 $identity = [Security.Principal.WindowsIdentity]::GetCurrent()
 if (-not ([Security.Principal.WindowsPrincipal]$identity).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)) {
     throw 'Run this from an elevated PowerShell (Run as administrator).'
 }
-if ($PSVersionTable.PSVersion.Major -ne 5) {
-    Warn "This is PowerShell $($PSVersionTable.PSVersion). vlab's scripts are written for Windows PowerShell 5.1; run the installer from 'Windows PowerShell', not pwsh."
-}
+if ($PSVersionTable.PSVersion.Major -ne 5) { Warn "Use 'Windows PowerShell' 5.1 (powershell.exe), not pwsh $($PSVersionTable.PSVersion)." }
 if ($PortalRoot -match '\s') { throw "Install the portal in a path without spaces (now: $PortalRoot). C:\vlab-portal is recommended." }
+New-Item -ItemType Directory -Force $DataDir, $CatalogDir, (Join-Path $PortalRoot 'logs') | Out-Null
+Lock-Down $DataDir
 Info "Portal folder : $PortalRoot"
 Info "Runs as      : $($identity.Name)"
 
-$mode = if (Test-Path (Join-Path $VlabRoot 'settings.cfg')) { 'brownfield' } else { 'greenfield' }
-Info "vlab folder  : $VlabRoot  ($mode)"
+$cfg = $null
+if (Test-Path $CfgPath) { $cfg = Get-Content $CfgPath -Raw | ConvertFrom-Json }
+$configured = $cfg -and $cfg.vcenter -and $cfg.vcenter.server
+$legacyCfg = Join-Path $LegacyVlabRoot 'settings.cfg'
+$mode = if ($configured) { 'reinstall' } elseif ((Test-Path $legacyCfg) -and -not $Greenfield) { 'brownfield' } else { 'greenfield' }
+Info "Mode         : $mode"
 
-# ------------------------------------------------------------------- greenfield: get vlab
-if ($mode -eq 'greenfield') {
-    Step "Greenfield: downloading $VlabRepo @ $($VlabCommit.Substring(0,7)) into $VlabRoot"
-    if ((Test-Path $VlabRoot) -and (Get-ChildItem $VlabRoot -Force | Select-Object -First 1)) {
-        throw "$VlabRoot exists but has no settings.cfg. Move it away or pass -VlabRoot <empty folder>."
-    }
-    $zip = Join-Path $env:TEMP "vlab-$VlabCommit.zip"
-    Invoke-WebRequest "https://github.com/$VlabRepo/archive/$VlabCommit.zip" -OutFile $zip -UseBasicParsing
-    $tmp = Join-Path $env:TEMP "vlab-extract-$([guid]::NewGuid().ToString('N'))"
-    Expand-Archive $zip $tmp
-    $inner = Get-ChildItem $tmp -Directory | Select-Object -First 1
-    New-Item -ItemType Directory -Force $VlabRoot | Out-Null
-    Get-ChildItem $inner.FullName -Force | Move-Item -Destination $VlabRoot
-    Remove-Item $zip, $tmp -Recurse -Force
-    Get-ChildItem $VlabRoot -Recurse -File | Unblock-File
-    Info "vlab scripts installed in $VlabRoot"
-
-    Step 'Greenfield: vlab settings (written to settings.cfg)'
-    # Same keys as vlab's settings.cfg.sample. Values can come from -SettingsFile for unattended installs.
-    $fields = [ordered]@{
-        sitename     = @('Portal name shown in the browser', 'vLab Portal')
-        vCenter      = @('vCenter server (FQDN or IP)', '')
-        VICluster    = @('vSphere cluster that runs the labs', '')
-        vswitch      = @('Standard vSwitch for lab port groups (on every host in the cluster)', 'vSwitch0')
-        VIPortgroup  = @('Port group the lab gateways use as their WAN', 'VM Network')
-        vlanbase     = @('First VLAN ID the lab networks may use', '1000')
-        cluster_mgmt = @('ONTAP cluster management address', '')
-        vserver      = @('ONTAP SVM (vserver) that holds the lab volumes', '')
-        VIDatastore  = @('NFS datastore (from that SVM) whose junction holds the lab volumes', '')
-        newID        = @('Lab copies are numbered after this', '1000')
-        autostart    = @('Start labs automatically after provisioning (true/false)', 'false')
-        rdpdomain    = @('Default RDP domain for lab jumphosts', 'lab')
-        rdpuser      = @('Default RDP user for lab jumphosts', 'administrator')
-        rdppassword  = @('Default RDP password for lab jumphosts', '')
-    }
-    $preset = @{}
-    if ($SettingsFile) { (Get-Content $SettingsFile -Raw | ConvertFrom-Json).PSObject.Properties | ForEach-Object { $preset[$_.Name] = [string]$_.Value } }
-    $lines = foreach ($k in $fields.Keys) {
-        $v = $preset[$k]
-        if ($null -eq $v) {
-            if ($k -eq 'rdppassword') {
-                $sec = Read-Host "    $($fields[$k][0])" -AsSecureString
-                $v = [Runtime.InteropServices.Marshal]::PtrToStringBSTR([Runtime.InteropServices.Marshal]::SecureStringToBSTR($sec))
-            } else {
-                do { $v = Ask $fields[$k][0] $fields[$k][1] } while ([string]::IsNullOrWhiteSpace($v))
-            }
+# ------------------------------------------------------------------------------ settings
+if (-not $configured) {
+    $oldCfg = $cfg
+    $s = [ordered]@{}
+    if ($mode -eq 'brownfield') {
+        Step "Brownfield: importing settings from $legacyCfg"
+        $old = ReadKV $legacyCfg
+        $s.siteName = $old.sitename; $s.vcenter = $old.vCenter; $s.cluster = $old.VICluster; $s.vswitch = $old.vswitch
+        $s.wanPortgroup = $old.VIPortgroup; $s.vlanBase = $old.vlanbase; $s.ontapCluster = $old.cluster_mgmt
+        $s.svm = $old.vserver; $s.datastore = $old.VIDatastore; $s.firstId = $old.newID; $s.autostart = $old.autostart
+        $s.rdpDomain = $old.rdpdomain; $s.rdpUser = $old.rdpuser; $s.rdpPassword = $old.rdppassword
+        foreach ($k in $s.Keys) { if ($k -ne 'rdpPassword') { Info ("{0,-13} {1}" -f $k, $s[$k]) } }
+    } else {
+        Step 'Greenfield: lab infrastructure settings'
+        $preset = @{}
+        if ($SettingsFile) { (Get-Content $SettingsFile -Raw | ConvertFrom-Json).PSObject.Properties | ForEach-Object { $preset[$_.Name] = [string]$_.Value } }
+        $fields = [ordered]@{
+            siteName     = @('Portal name shown in the browser', 'vLab Portal')
+            vcenter      = @('vCenter server (FQDN or IP)', '')
+            cluster      = @('vSphere cluster that runs the labs', '')
+            vswitch      = @('Standard vSwitch for lab port groups (must exist on every host of that cluster)', 'vSwitch0')
+            wanPortgroup = @('Port group for the lab gateways'' WAN side', 'VM Network')
+            vlanBase     = @('Lab VLANs are allocated above this number (your switches must trunk the range)', '1000')
+            ontapCluster = @('ONTAP cluster management address', '')
+            svm          = @('ONTAP SVM that holds the lab volumes', '')
+            datastore    = @('NFS datastore (from that SVM) whose junction holds the lab volumes', '')
+            firstId      = @('Lab copies are numbered after this', '1000')
+            autostart    = @('Start lab copies right after provisioning (true/false)', 'false')
+            rdpDomain    = @('Default RDP domain for lab jumphosts', 'lab')
+            rdpUser      = @('Default RDP user for lab jumphosts', 'administrator')
         }
-        "$k=$v"
+        foreach ($k in $fields.Keys) {
+            if ($preset.ContainsKey($k)) { $s[$k] = $preset[$k] } else { $s[$k] = AskRequired $fields[$k][0] $fields[$k][1] }
+        }
+        if ($preset.ContainsKey('rdpPassword')) { $s.rdpPassword = $preset.rdpPassword } else {
+            $sec = Read-Host '    Default RDP password for lab jumphosts' -AsSecureString
+            $s.rdpPassword = [Runtime.InteropServices.Marshal]::PtrToStringBSTR([Runtime.InteropServices.Marshal]::SecureStringToBSTR($sec))
+        }
     }
-    Set-Content -Path (Join-Path $VlabRoot 'settings.cfg') -Value $lines -Encoding ASCII
-    Info 'settings.cfg written. (rdppassword is stored in plain text, exactly like vlab 1.x.)'
-    $cmdb = Join-Path $VlabRoot 'cmdb'
-    if (-not (Test-Path "$cmdb\descriptions.tbl")) { Copy-Item "$cmdb\descriptions.tbl.sample" "$cmdb\descriptions.tbl" }
+    $cfg = [pscustomobject][ordered]@{
+        port = $Port; inventoryIntervalSec = 60; maxConcurrentJobs = 2; secureCookies = $false
+        site    = [pscustomobject][ordered]@{ name = $(if ($s.siteName) { $s.siteName } else { 'vLab Portal' }) }
+        vcenter = [pscustomobject][ordered]@{ server = $s.vcenter; cluster = $s.cluster; vswitch = $s.vswitch; wanPortgroup = $s.wanPortgroup; vlanBase = [int]$s.vlanBase }
+        ontap   = [pscustomobject][ordered]@{ cluster = $s.ontapCluster; svm = $s.svm; datastore = $s.datastore; junctionRoot = '' }
+        labs    = [pscustomobject][ordered]@{ firstId = [int]$s.firstId; autostart = ("$($s.autostart)" -eq 'true'); maxSnapshotsPerLab = 5 }
+        rdp     = [pscustomobject][ordered]@{ domain = $s.rdpDomain; user = $s.rdpUser; password = $s.rdpPassword }
+        guacamole = [pscustomobject][ordered]@{ url = ''; jsonSecretKey = '' }
+    }
+    # an older config.json (portal 0.1) may already hold the Guacamole settings: keep them
+    if ($oldCfg -and $oldCfg.guacamole) { $cfg.guacamole = $oldCfg.guacamole; Info 'Kept Guacamole settings from the previous config.json' }
+    if ($oldCfg -and $oldCfg.port) { $cfg.port = [int]$oldCfg.port }
+    foreach ($k in 'vcenter', 'cluster', 'ontapCluster', 'svm', 'datastore') { if (-not $s[$k]) { throw "Setting '$k' is empty." } }
+} else {
+    Step 'Keeping existing settings (config.json)'
+    Info "vCenter $($cfg.vcenter.server) / cluster $($cfg.vcenter.cluster); ONTAP $($cfg.ontap.cluster) / SVM $($cfg.ontap.svm)"
 }
 
-# -------------------------------------------------------------------- PowerShell modules
+# ------------------------------------------------------ brownfield: descriptions & diagrams
+if ($mode -eq 'brownfield') {
+    $cmdb = Join-Path $LegacyVlabRoot 'cmdb'
+    if (Test-Path $cmdb) {
+        Step "Brownfield: importing catalog descriptions and diagrams from $cmdb"
+        $n = 0
+        foreach ($f in Get-ChildItem $cmdb -File | Where-Object { $_.Extension -in '.jpg', '.png', '.conf' -or $_.Name -eq 'descriptions.tbl' }) {
+            $dest = Join-Path $CatalogDir $f.Name
+            if (-not (Test-Path $dest)) { Copy-Item $f.FullName $dest; $n++ }
+        }
+        Info "$n file(s) copied to $CatalogDir"
+    }
+}
+
+# --------------------------------------------------------------------- PowerShell modules
 Step 'PowerShell modules (VCF.PowerCLI, NetApp.ONTAP)'
 $need = @()
 if (-not (Get-Module -ListAvailable VMware.VimAutomation.Core)) { $need += 'VCF.PowerCLI' }
@@ -148,40 +177,50 @@ if ($need.Count) {
         Info "Installing $m from the PowerShell Gallery (a few minutes)..."
         Install-Module -Name $m -Scope AllUsers -Force -AllowClobber -Repository PSGallery
     }
-    Import-Module VMware.VimAutomation.Core
-    Set-PowerCLIConfiguration -Scope AllUsers -ParticipateInCEIP $false -InvalidCertificateAction Ignore `
-        -DisplayDeprecationWarnings $false -DefaultVIServerMode Multiple -Confirm:$false | Out-Null
 } else { Info 'Already installed.' }
+Import-Module VMware.VimAutomation.Core -WarningAction SilentlyContinue
+Set-PowerCLIConfiguration -Scope AllUsers -ParticipateInCEIP $false -InvalidCertificateAction Ignore `
+    -DisplayDeprecationWarnings $false -Confirm:$false | Out-Null
 
 # ---------------------------------------------------------------------------- credentials
-$conf = Get-Content (Join-Path $VlabRoot 'settings.cfg') | Out-String | ConvertFrom-StringData
+$credFiles = @(
+    @{ File = Join-Path $DataDir 'vcenter.cred.xml'; Legacy = Join-Path $LegacyVlabRoot 'vicred.clixml'; What = "vCenter $($cfg.vcenter.server)" },
+    @{ File = Join-Path $DataDir 'ontap.cred.xml'; Legacy = Join-Path $LegacyVlabRoot 'nccred.clixml'; What = "ONTAP cluster $($cfg.ontap.cluster)" }
+)
 if (-not $SkipCredentials) {
-    Step 'vCenter / ONTAP credentials (saved encrypted for this Windows account only)'
-    $vi = Join-Path $VlabRoot 'vicred.clixml'
-    $nc = Join-Path $VlabRoot 'nccred.clixml'
-    foreach ($pair in @(@($vi, "vCenter $($conf.vCenter)"), @($nc, "ONTAP cluster $($conf.cluster_mgmt)"))) {
-        $file = $pair[0]; $what = $pair[1]
-        $usable = $false
-        if (Test-Path $file) {
-            try { $null = Import-Clixml $file; $usable = $true; Info "Using existing $(Split-Path $file -Leaf)" }
-            catch { Warn "$(Split-Path $file -Leaf) was saved by a different Windows account; it must be re-entered." }
+    Step 'vCenter / ONTAP credentials (saved in .\data, encrypted for this Windows account only)'
+    foreach ($c in $credFiles) {
+        $ok = $false
+        if (Test-Path $c.File) {
+            try { $null = Import-Clixml $c.File; $ok = $true; Info "Using saved credentials for $($c.What)" }
+            catch { Warn "Saved credentials for $($c.What) belong to another Windows account." }
         }
-        if (-not $usable) {
-            $c = Get-Credential -Message "Credentials for $what"
-            if (-not $c) { throw "No credentials entered for $what." }
-            if (Test-Path $file) { Copy-Item $file "$file.bak" -Force }
-            $c | Export-Clixml $file
-            Info "Saved $(Split-Path $file -Leaf)"
+        if (-not $ok -and $mode -eq 'brownfield' -and (Test-Path $c.Legacy)) {
+            try { $cred = Import-Clixml $c.Legacy; $cred | Export-Clixml $c.File; $ok = $true; Info "Imported vlab 1.x credentials for $($c.What)" }
+            catch { Warn "vlab 1.x credentials for $($c.What) were saved by another account; enter them again." }
         }
+        if (-not $ok) {
+            $cred = Get-Credential -Message "Credentials for $($c.What)"
+            if (-not $cred) { throw "No credentials entered for $($c.What)." }
+            $cred | Export-Clixml $c.File
+            Info "Saved credentials for $($c.What)"
+        }
+    }
+    Step 'Testing the connections'
+    try {
+        Import-Module NetApp.ONTAP -WarningAction SilentlyContinue
+        $null = Connect-VIServer -Server $cfg.vcenter.server -Credential (Import-Clixml $credFiles[0].File) -ErrorAction Stop
+        $cl = Get-Cluster -Name $cfg.vcenter.cluster -ErrorAction Stop
+        Info "vCenter OK: cluster $($cl.Name), $(@($cl | Get-VMHost).Count) host(s)"
+        $null = Connect-NcController $cfg.ontap.cluster -Vserver $cfg.ontap.svm -Credential (Import-Clixml $credFiles[1].File) -ErrorAction Stop
+        Info "ONTAP OK: $(@(Get-NcVol -Name 'lab_*' -Vserver $cfg.ontap.svm).Count) lab volume(s) on SVM $($cfg.ontap.svm)"
+    } catch {
+        Warn "Connection test failed: $($_.Exception.Message)"
+        Warn 'Fix the setting or credentials (re-run with the right values, or delete data\*.cred.xml), then re-run.'
     }
 }
 
-# ------------------------------------------------------------------------- PS remoting
-Step 'PowerShell remoting on localhost (vlab scripts keep a local session to vCenter/ONTAP)'
-try { $null = Test-WSMan -ComputerName localhost -ErrorAction Stop; Info 'Already enabled.' }
-catch { Enable-PSRemoting -Force -SkipNetworkProfileCheck | Out-Null; Info 'Enabled.' }
-
-# ---------------------------------------------------------------------- Node.js runtime
+# ------------------------------------------------------------------------ Node.js runtime
 Step "Node.js $NodeVersion (private copy in .\runtime\node)"
 $nodeExe = Join-Path $PortalRoot 'runtime\node\node.exe'
 $have = if (Test-Path $nodeExe) { (& $nodeExe -v) } else { '' }
@@ -203,44 +242,32 @@ if ($have -ne $NodeVersion) {
 }
 Info ((& $nodeExe -v) + ' ready.')
 
-# ------------------------------------------------------------------------ npm packages
 Step 'Portal dependencies (npm ci)'
 Push-Location $PortalRoot
 try {
     $env:Path = (Join-Path $PortalRoot 'runtime\node') + ';' + $env:Path
     cmd /c "npm ci --omit=dev --no-audit --no-fund --loglevel=error 2>&1"
-    if ($LASTEXITCODE -ne 0) { throw 'npm ci failed (see output above). The server needs HTTPS access to registry.npmjs.org.' }
+    if ($LASTEXITCODE -ne 0) { throw 'npm ci failed (see above). The server needs HTTPS access to registry.npmjs.org.' }
 } finally { Pop-Location }
 
-# ------------------------------------------------------------------------- config.json
-Step 'Portal configuration (config.json)'
-$cfgPath = Join-Path $PortalRoot 'config.json'
-if (Test-Path $cfgPath) {
-    $cfg = Get-Content $cfgPath -Raw | ConvertFrom-Json
-    Info 'Keeping existing config.json'
-    if ($GuacamoleUrl) { $cfg.guacamole.url = $GuacamoleUrl }
-    if ($GuacamoleKey) { $cfg.guacamole.jsonSecretKey = $GuacamoleKey }
-} else {
-    if (-not $GuacamoleUrl) {
-        Info 'Browser remote desktop (Apache Guacamole) is optional. See README "Remote desktop".'
-        $GuacamoleUrl = Ask 'Guacamole URL, e.g. http://10.0.0.5:8085/guacamole (Enter to skip for now)' ''
-    }
-    if ($GuacamoleUrl -and -not $GuacamoleKey) { $GuacamoleKey = Ask 'Guacamole JSON secret key (32 hex characters)' '' }
-    $cfg = [pscustomobject][ordered]@{
-        port = $Port; vlabRoot = $VlabRoot; inventoryIntervalSec = 60; maxConcurrentJobs = 2; secureCookies = $false
-        guacamole = [pscustomobject][ordered]@{ url = $GuacamoleUrl; jsonSecretKey = $GuacamoleKey }
-    }
+# ---------------------------------------------------------------------- config.json + guac
+Step 'Remote desktop (Apache Guacamole)'
+if ($GuacamoleUrl) { $cfg.guacamole.url = $GuacamoleUrl }
+if ($GuacamoleKey) { $cfg.guacamole.jsonSecretKey = $GuacamoleKey }
+if (-not $cfg.guacamole.url) {
+    Info 'Optional; see README "Remote desktop". Press Enter to skip for now.'
+    $cfg.guacamole.url = Ask 'Guacamole URL, e.g. http://10.0.0.5:8085/guacamole' ''
+    if ($cfg.guacamole.url -and -not $cfg.guacamole.jsonSecretKey) { $cfg.guacamole.jsonSecretKey = Ask 'Guacamole JSON secret key (32 hex characters)' '' }
 }
 if ($cfg.guacamole.jsonSecretKey -and $cfg.guacamole.jsonSecretKey -notmatch '^[0-9a-fA-F]{32}$') {
-    throw 'The Guacamole key must be exactly 32 hex characters (JSON_SECRET_KEY on the Guacamole host).'
+    throw 'The Guacamole key must be exactly 32 hex characters (printed by guacamole/install-guacamole.sh).'
 }
-$cfg | ConvertTo-Json | Set-Content $cfgPath -Encoding ASCII
-# config.json holds the Guacamole key: only this account, SYSTEM and Administrators may read it
-& icacls $cfgPath /inheritance:r /grant "$($identity.Name):F" /grant '*S-1-5-18:F' /grant '*S-1-5-32-544:F' | Out-Null
+Info $(if ($cfg.guacamole.url) { "Connect button uses $($cfg.guacamole.url)" } else { 'Connect button off until configured.' })
+$cfg | ConvertTo-Json -Depth 5 | Set-Content $CfgPath -Encoding ASCII
+& icacls $CfgPath /inheritance:r /grant "$($identity.Name):F" /grant '*S-1-5-18:F' /grant '*S-1-5-32-544:F' | Out-Null
 $Port = [int]$cfg.port
-Info "Port $Port, vlab at $($cfg.vlabRoot), remote desktop: $(if ($cfg.guacamole.url) { $cfg.guacamole.url } else { 'not configured' })"
 
-# ---------------------------------------------------------------------------- firewall
+# ------------------------------------------------------------------------------- firewall
 Step "Windows Firewall: allow TCP $Port"
 $ruleName = "vLabPortal-$Port"
 if (-not (Get-NetFirewallRule -Name $ruleName -ErrorAction SilentlyContinue)) {
@@ -248,8 +275,7 @@ if (-not (Get-NetFirewallRule -Name $ruleName -ErrorAction SilentlyContinue)) {
 }
 Info 'Done.'
 
-# --------------------------------------------------------------------- scheduled task
-New-Item -ItemType Directory -Force (Join-Path $PortalRoot 'logs') | Out-Null
+# ------------------------------------------------------------------------- scheduled task
 if ($SkipService) {
     Step 'Skipping the scheduled task (-SkipService). Start by hand with: .\runtime\node\node.exe server.js'
 } else {
@@ -273,19 +299,19 @@ if ($SkipService) {
         Start-Sleep 1
         try { $ok = (Invoke-WebRequest "http://localhost:$Port/" -UseBasicParsing -TimeoutSec 2).StatusCode -eq 200 } catch { }
     }
-    if ($ok) { Info "Portal is running." } else { Warn "Portal did not answer yet. Check $PortalRoot\logs\portal.log" }
+    if ($ok) { Info 'Portal is running.' } else { Warn "Portal did not answer yet. Check $PortalRoot\logs\portal.log" }
 }
 
-# ------------------------------------------------------------------------------- done
+# ---------------------------------------------------------------------------------- done
 $hostName = ([System.Net.Dns]::GetHostEntry($env:COMPUTERNAME)).HostName
 Write-Host ''
 Write-Host '============================================================' -ForegroundColor Green
 Write-Host " vLab Portal installed ($mode)" -ForegroundColor Green
 Write-Host "   URL : http://$hostName`:$Port"
-$pw = Join-Path $PortalRoot 'data\initial-admin-password.txt'
-if ((Test-Path $pw) -or -not (Test-Path (Join-Path $PortalRoot 'data\portal.db'))) {
+$pw = Join-Path $DataDir 'initial-admin-password.txt'
+if ((Test-Path $pw) -or -not (Test-Path (Join-Path $DataDir 'portal.db'))) {
     Write-Host "   First sign-in: user 'admin', one-time password in $pw (created when the portal first starts)"
 }
-if ($mode -eq 'brownfield') { Write-Host '   The legacy vlab portal (port 8081) still runs; see README "Retiring the legacy portal".' }
+if ($mode -eq 'brownfield') { Write-Host '   vlab 1.x was not changed; its portal (port 8081) can be retired. See README.' }
 if (-not $cfg.guacamole.url) { Write-Host '   Connect button is off until Guacamole is set up; see README "Remote desktop".' }
 Write-Host '============================================================' -ForegroundColor Green

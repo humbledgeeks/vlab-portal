@@ -3,3 +3,5 @@ runtime/
 data/
 logs/
 config.json
+catalog/*
+!catalog/README.md
