@@ -6,6 +6,6 @@
   "secureCookies": false,
   "guacamole": {
     "url": "http://<guacamole-host>:8085/guacamole",
-    "jsonSecretKey": "<JSON_SECRET_KEY from ~/guacamole/guacamole.env on the RHEL9 host>"
+    "jsonSecretKey": "<JSON_SECRET_KEY printed by guacamole/install-guacamole.sh>"
   }
 }
