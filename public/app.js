@@ -332,7 +332,7 @@ async function viewCatalog() {
   const cards = inv.templates.map((t) => {
     const busy = !!t.job;
     const foot = [h('button', { class: 'btn primary', disabled: quotaFull || (admin && t.status === 'Disabled'),
-      title: quotaFull ? `You're at your limit of ${inv.quota.max} lab(s)` : '', onclick: () => provision(t) }, 'Get a copy')];
+      title: quotaFull ? `You're at your limit of ${inv.quota.max} lab(s)` : '', onclick: () => provision(t) }, 'Provision')];
     if (admin && t.status === 'Started') foot.push(connectButton(t, true, true));
     if (admin) foot.push(templateMenu(t));
     return h('div', { class: 'card lab-card' },
@@ -354,7 +354,7 @@ async function viewCatalog() {
 }
 
 async function provision(t) {
-  if (!await confirmBox('Get a copy', `Create your own copy of ${t.name}? It's ready to start in a few minutes.`, 'Create copy')) return;
+  if (!await confirmBox('Provision', `Create your own copy of ${t.name}? It's ready to start in a few minutes.`, 'Provision')) return;
   try {
     const r = await api(`/api/catalog/${encodeURIComponent(t.name)}/provision`, { method: 'POST' });
     toast(`Creating ${r.name}…`);

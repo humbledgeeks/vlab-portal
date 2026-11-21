@@ -210,7 +210,7 @@ Next, add lab templates (see [Lab templates](#lab-templates)). The catalog stays
 ## Using the portal
 
 **Users**
-* **Catalog → Get a copy** clones the template. The job page shows the live log, and the copy is usually ready within a minute.
+* **Catalog → Provision** clones the template. The job page shows the live log, and the copy is usually ready within a minute.
 * **My labs**:
   * **Start** powers on the copy.
   * **Connect** opens the jumphost desktop in a new tab. It appears once the lab is running and the gateway has an IP.
