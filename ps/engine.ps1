@@ -65,8 +65,13 @@ switch ($Action) {
         if ($trunked.Count) {
             # "vSwitch backed" labs: each internal vSwitch of the template gets a private copy
             Say 'Template uses trunked port groups: creating private vSwitches'
+            $first = $true
             foreach ($vs in @($srcVMs | Where-Object { $_.Name -notlike '*gateway*' } | Get-VirtualSwitch | Sort-Object Name -Unique)) {
-                $vsNew = if ($vs.Name -like "$Template*") { $Lab + $vs.Name.Substring($Template.Length) } else { "${Lab}_$($vs.Name)" }
+                # the first internal vSwitch is named after the lab; any others keep the old naming
+                $vsNew = if ($first) { $Lab }
+                         elseif ($vs.Name -like "$Template*") { $Lab + $vs.Name.Substring($Template.Length) }
+                         else { "${Lab}_$($vs.Name)" }
+                $first = $false
                 Say ":: vSwitch $($vs.Name) -> $vsNew"
                 $newVss = Get-LabHosts | New-VirtualSwitch -Name $vsNew -Mtu 9000
                 $newVss | Get-SecurityPolicy | Set-SecurityPolicy -MacChanges $true -AllowPromiscuous $true -ForgedTransmits $true | Out-Null
@@ -131,7 +136,7 @@ switch ($Action) {
             Say ":: removed port group $($p.PortGroup.Name) on $($p.Host.Name)"
         }
         foreach ($h in Get-VMHost) {
-            foreach ($vs in @($h | Get-VirtualSwitch -Standard -ErrorAction SilentlyContinue | Where-Object { $_.Name -like "${Lab}_*" })) {
+            foreach ($vs in @($h | Get-VirtualSwitch -Standard -ErrorAction SilentlyContinue | Where-Object { $_.Name -eq $Lab -or $_.Name -like "${Lab}_*" })) {
                 if (-not @($vs | Get-VirtualPortGroup).Count) { $vs | Remove-VirtualSwitch -Confirm:$false; Say ":: removed vSwitch $($vs.Name) on $($h.Name)" }
             }
         }
