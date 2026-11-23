@@ -116,7 +116,10 @@ app.get('/api/inventory', auth.requireUser, (req, res) => {
   const users = new Map(db.prepare('SELECT id, username, display_name FROM users').all().map((u) => [u.id, u]));
   const activeJobs = new Map(db.prepare(`SELECT target, action, id FROM jobs WHERE status IN ('queued','running')`).all().map((j) => [j.target, j]));
 
-  const templates = inv.templates.filter((t) => granted.has(t.name)).map((t) => ({
+  // a template still being made by "Split clone" shows up only once its job has finished
+  const splitting = new Set(db.prepare(`SELECT args FROM jobs WHERE action = 'lab-split' AND status IN ('queued','running')`).all()
+    .map((j) => JSON.parse(j.args).newName));
+  const templates = inv.templates.filter((t) => granted.has(t.name) && !splitting.has(t.name)).map((t) => ({
     name: t.name, description: desc[t.name] || '', hasDiagram: !!vlab.diagramPath(t.name),
     ...(admin ? { status: t.vapp ? t.vapp.status : 'Disabled', sizeGB: t.sizeGB, job: activeJobs.get(t.name) || null,
       gatewayIp: t.vapp ? t.vapp.gatewayIp : null, vms: t.vapp ? (t.vapp.vms || []) : [] } : {}),
@@ -132,6 +135,7 @@ app.get('/api/inventory', auth.requireUser, (req, res) => {
       name: r.name, template: r.template, description: desc[r.template] || '',
       status: i ? (i.vapp ? i.vapp.status : 'Disabled') : 'Provisioning',
       gatewayIp: i && i.vapp ? i.vapp.gatewayIp : null, vmCount: i && i.vapp ? i.vapp.vmCount : 0,
+      vms: i && i.vapp ? (i.vapp.vms || []) : [],
       sizeGB: i ? i.sizeGB : null, hasDiagram: !!vlab.diagramPath(r.template),
       owner: owner ? { id: owner.id, username: owner.username } : null,
       job: activeJobs.get(r.name) || null,
@@ -207,7 +211,7 @@ function sendConnectUrl(req, res, inst, name, template) {
   if (!inst.vapp.gatewayIp) return res.status(409).json({ error: 'The lab gateway has no address yet. Try again in a minute.' });
   const url = guac.connectUrl({
     username: req.user.username, connectionName: name, hostname: inst.vapp.gatewayIp,
-    rdp: vlab.rdpCredentials(template),
+    rdp: vlab.rdpCredentials(name, template),   // the lab's own .conf, else its template's
   });
   audit(req, 'lab.connect', name);
   res.json({ url });
@@ -251,7 +255,8 @@ app.post('/api/labs/:name/snapshots/:snap/restore', auth.requireUser, (req, res)
   const snap = snapshotsOf(inst).find((s) => s.name === req.params.snap);
   if (!snap) return res.status(404).json({ error: 'No such snapshot.' });
   try {
-    const id = jobs.enqueue(req.user.id, 'lab-restore', inst.name, { lab: inst.name, template: inst.parent, snapshot: snap.name });
+    const former = (labRow(inst.name) || {}).former_names || '';
+    const id = jobs.enqueue(req.user.id, 'lab-restore', inst.name, { lab: inst.name, template: inst.parent, snapshot: snap.name, former });
     audit(req, 'lab.restore', inst.name, { snapshot: snap.name, original: snap.original, job: id });
     res.json({ ok: true, jobId: id });
   } catch (e) { res.status(e.status || 500).json({ error: e.message }); }
@@ -273,9 +278,12 @@ app.delete('/api/labs/:name/snapshots/:snap', auth.requireUser, (req, res) => {
 app.get('/api/jobs', auth.requireUser, (req, res) => {
   const limit = Math.min(parseInt(req.query.limit, 10) || 50, 200);
   const target = typeof req.query.target === 'string' ? req.query.target : null;
+  const hours = Math.min(parseInt(req.query.hours, 10) || 0, 24 * 365);
   const where = []; const args = [];
   if (!isAdmin(req)) { where.push('j.user_id = ?'); args.push(req.user.id); }
   if (target) { where.push('j.target = ?'); args.push(target); }
+  // ?hours=N: jobs from the last N hours, plus any still queued or running
+  if (hours) { where.push(`(j.created_at >= datetime('now', ?) OR j.status IN ('queued','running'))`); args.push(`-${hours} hours`); }
   const rows = db.prepare(`SELECT j.id, j.action, j.target, j.status, j.created_at, j.started_at, j.finished_at, u.username
     FROM jobs j LEFT JOIN users u ON u.id = j.user_id ${where.length ? 'WHERE ' + where.join(' AND ') : ''}
     ORDER BY j.id DESC LIMIT ${limit}`).all(...args);
@@ -285,6 +293,8 @@ app.get('/api/jobs', auth.requireUser, (req, res) => {
 app.get('/api/jobs/:id', auth.requireUser, (req, res) => {
   const j = db.prepare(`SELECT j.*, u.username FROM jobs j LEFT JOIN users u ON u.id = j.user_id WHERE j.id = ?`).get(parseInt(req.params.id, 10) || 0);
   if (!j || (!isAdmin(req) && j.user_id !== req.user.id)) return res.status(404).json({ error: 'No such job.' });
+  // rename / split: the job page links to the lab or template it produced
+  try { const p = JSON.parse(j.args || '{}'); if (p.newName) j.newName = p.newName; } catch { /* old job */ }
   delete j.args;
   res.json(j);
 });
@@ -434,6 +444,49 @@ app.put('/api/labs/:name/owner', auth.requireUser, auth.requireAdmin, (req, res)
   res.json({ ok: true });
 });
 
+// ---- admin: rename a lab copy, or split it off into a new catalog template ------------------
+// Names are matched by prefix when networks are reconnected or cleaned up, so a new name may not
+// be the start of another lab's name, nor start with a lab copy's name. (The engine checks again.)
+function newNameProblem(newName, current) {
+  if (!vlab.isLabName(newName)) return 'Use lab_ followed by letters, digits, dot, dash or underscore (up to 64 characters).';
+  if (newName === current) return 'That is already its name.';
+  const inv = vlab.inventory();
+  const copies = new Set([...inv.instances.map((i) => i.name), ...db.prepare('SELECT name FROM labs').all().map((r) => r.name)]);
+  const all = new Set([...copies, ...inv.templates.map((t) => t.name)]);
+  for (const n of all) {
+    if (n === newName) return `${newName} already exists.`;
+    if (n.startsWith(newName)) return `${newName} is the start of the existing lab ${n}; choose another name.`;
+    if (copies.has(n) && newName.startsWith(n)) return `${newName} starts with the name of the lab copy ${n}; choose another name.`;
+  }
+  if (db.prepare(`SELECT 1 FROM jobs WHERE action IN ('lab-rename','lab-split') AND status IN ('queued','running') AND args LIKE ?`)
+    .get(`%"newName":"${newName}"%`)) return `${newName} is already being created.`;
+  return null;
+}
+
+app.post('/api/labs/:name/rename', auth.requireUser, auth.requireAdmin, (req, res) => {
+  const inst = labForSnapshots(req, res); if (!inst) return;
+  const newName = String((req.body || {}).newName || '').trim();
+  const problem = newNameProblem(newName, inst.name);
+  if (problem) return res.status(400).json({ error: problem });
+  try {
+    const id = jobs.enqueue(req.user.id, 'lab-rename', inst.name, { lab: inst.name, newName });
+    audit(req, 'lab.rename', inst.name, { newName, job: id });
+    res.json({ ok: true, jobId: id });
+  } catch (e) { res.status(e.status || 500).json({ error: e.message }); }
+});
+
+app.post('/api/labs/:name/split', auth.requireUser, auth.requireAdmin, (req, res) => {
+  const inst = labForSnapshots(req, res); if (!inst) return;
+  const newName = String((req.body || {}).newName || '').trim();
+  const problem = newNameProblem(newName, inst.name);
+  if (problem) return res.status(400).json({ error: problem });
+  try {
+    const id = jobs.enqueue(req.user.id, 'lab-split', inst.name, { lab: inst.name, newName });
+    audit(req, 'lab.split', inst.name, { newName, job: id });
+    res.json({ ok: true, jobId: id });
+  } catch (e) { res.status(e.status || 500).json({ error: e.message }); }
+});
+
 app.get('/api/audit', auth.requireUser, auth.requireAdmin, (req, res) => {
   const limit = Math.min(parseInt(req.query.limit, 10) || 200, 1000);
   res.json(db.prepare(`SELECT * FROM audit ORDER BY id DESC LIMIT ${limit}`).all());
@@ -450,6 +503,15 @@ app.use((err, req, res, _next) => {
   res.status(500).json({ error: 'Something went wrong on the server.' });
 });
 
-jobs.setOnFinished(() => vlab.runInventory());
+jobs.setOnFinished((job, ok) => {
+  if (ok && job.action === 'lab-split') {
+    try {
+      const p = JSON.parse(job.args);
+      const src = labRow(p.lab);
+      if (src) vlab.adoptTemplateFiles(p.newName, src.template, p.lab);
+    } catch (e) { console.error('[split] could not copy catalog files:', e.message); }
+  }
+  vlab.runInventory();
+});
 vlab.startPolling();
 app.listen(config.port, () => console.log(`[portal] listening on http://0.0.0.0:${config.port} (vCenter ${config.vcenter.server}, ONTAP ${config.ontap.cluster}/${config.ontap.svm})`));

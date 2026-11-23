@@ -132,6 +132,7 @@ function statusPill(status, job) {
 }
 const JOB_LABELS = { provision: 'Provisioning', start: 'Starting', stop: 'Shutting down', kill: 'Powering off', destroy: 'Destroying',
   'lab-snapshot': 'Taking snapshot', 'lab-restore': 'Restoring', 'lab-snapdelete': 'Deleting snapshot',
+  'lab-rename': 'Renaming', 'lab-split': 'Split cloning',
   'template-enable': 'Enabling', 'template-disable': 'Disabling', 'template-master': 'Snapshotting template' };
 const jobLabel = (a) => JOB_LABELS[a] || a;
 function jobPill(status) {
@@ -275,7 +276,7 @@ async function viewDashboard() {
       tile('Cluster CPU', `${Math.round(c.cpuUsedMhz / 1000)} / ${Math.round(c.cpuTotalMhz / 1000)} GHz`, null, meter(c.cpuUsedMhz, c.cpuTotalMhz)),
       tile('Lab storage', `${Math.round((c.diskTotalGB - c.diskFreeGB) / 1024)} / ${Math.round(c.diskTotalGB / 1024)} TB`, null, meter(c.diskTotalGB - c.diskFreeGB, c.diskTotalGB)));
   }
-  const jobs = await api('/api/jobs?limit=8');
+  const jobs = await api('/api/jobs?hours=8&limit=50');
   render(
     pageHead(`Welcome, ${state.me.user.displayName || state.me.user.username}`, inv.updatedAt ? `Status updated ${when(inv.updatedAt.replace('T', ' ').replace(/\..*/, ''))}` : null,
       h('a', { class: 'btn primary', href: '#/catalog' }, 'Browse catalog')),
@@ -285,7 +286,8 @@ async function viewDashboard() {
       inv.labs.length ? labsTable(inv.labs.slice(0, 8), true)
         : h('div', { class: 'card empty' }, h('h2', {}, 'No labs yet'), h('p', {}, 'Pick one from the catalog to get your own copy.'),
           h('a', { class: 'btn primary', href: '#/catalog' }, 'Open catalog'))),
-    h('div', { class: 'section' }, h('h2', {}, 'Recent activity'), jobsTable(jobs)));
+    h('div', { class: 'section' }, h('h2', {}, 'Recent activity (last 8 hours)'),
+      jobsTable(jobs, h('span', {}, 'Nothing in the last 8 hours. ', h('a', { href: '#/jobs' }, 'See all activity')))));
   every(15000, () => { if (location.hash === '#/' || location.hash === '') softRefresh(viewDashboard); });
 }
 
@@ -309,7 +311,66 @@ function labsTable(labs, compact) {
       h('td', {}, statusPill(l.status, l.job), l.job ? h('div', {}, h('a', { class: 'lab-sub', href: `#/jobs/${l.job.id}` }, 'view progress')) : null),
       h('td', { class: 'mono' }, l.gatewayIp || '—'),
       admin ? h('td', {}, compact ? (l.owner ? l.owner.username : h('span', { class: 'muted' }, 'unassigned')) : ownerSelect(l)) : null,
-      h('td', {}, h('div', { class: 'actions' }, labButtons(l, true))))))));
+      h('td', {}, h('div', { class: 'actions' }, labButtons(l, true), admin && !compact ? labMenu(l) : null)))))));
+}
+
+// admin: Manage menu for a lab copy (All labs and the lab page)
+function labMenu(lab) {
+  const sel = h('select', { style: 'width:auto', disabled: !!lab.job || lab.status === 'Provisioning', onchange: () => {
+    const action = sel.value; sel.value = '';
+    if (action === 'rename') renameLab(lab);
+    if (action === 'split') splitLab(lab);
+  } },
+  h('option', { value: '' }, 'Manage…'),
+  h('option', { value: 'rename' }, 'Rename…'),
+  h('option', { value: 'split' }, 'Split clone to new template…'));
+  return sel;
+}
+
+// a lab_ name field with live checking of the allowed characters
+function nameField(label, value) {
+  const input = h('input', { type: 'text', value, maxlength: 64, autocomplete: 'off', spellcheck: 'false' });
+  const hint = h('div', { class: 'lab-sub' });
+  const check = () => {
+    const ok = /^lab_[A-Za-z0-9][A-Za-z0-9_.-]{0,60}$/.test(input.value.trim());
+    hint.textContent = ok ? '' : 'Start with lab_, then letters, digits, dot, dash or underscore.';
+    return ok;
+  };
+  input.addEventListener('input', check);
+  return { input, check, el: h('label', { class: 'field' }, h('span', {}, label), input, hint) };
+}
+
+function renameLab(lab) {
+  const f = nameField('New name', lab.name);
+  const submit = async () => {
+    if (!f.check()) return;
+    try {
+      const r = await api(`/api/labs/${encodeURIComponent(lab.name)}/rename`, { method: 'POST', body: { newName: f.input.value.trim() } });
+      d.close(); toast(`Rename queued (job #${r.jobId})`); go(`#/jobs/${r.jobId}`);
+    } catch (e) { toast(e.message, true); }
+  };
+  const d = dialog(`Rename ${lab.name}`, h('div', {}, f.el,
+    h('div', { class: 'notice' }, 'The lab is powered off first and stays off afterwards. Its volume, vApp, networks and VMs are renamed in ONTAP and vCenter; it takes a few minutes.'),
+    h('p', { class: 'muted' }, 'The owner, snapshots and Reset to original are kept.')),
+  [h('button', { class: 'btn', onclick: () => d.close() }, 'Cancel'), h('button', { class: 'btn primary', onclick: submit }, 'Rename')]);
+  f.input.focus(); f.input.select();
+}
+
+function splitLab(lab) {
+  const f = nameField('Name of the new template', `${lab.template}_v2`);
+  const submit = async () => {
+    if (!f.check()) return;
+    try {
+      const r = await api(`/api/labs/${encodeURIComponent(lab.name)}/split`, { method: 'POST', body: { newName: f.input.value.trim() } });
+      d.close(); toast(`Split clone queued (job #${r.jobId})`); go(`#/jobs/${r.jobId}`);
+    } catch (e) { toast(e.message, true); }
+  };
+  const d = dialog(`Split clone ${lab.name}`, h('div', {}, f.el,
+    h('p', {}, `Makes an independent copy of ${lab.name} in ONTAP (FlexClone, then split) and adds it to the Catalog as a new template, with its own vApp, networks and master snapshot. ${lab.name} itself is not changed.`),
+    lab.status === 'Started' ? h('div', { class: 'notice' }, 'The lab is running, so the copy is crash-consistent, like pulling the power plug. For a clean template, shut the lab down first.') : null,
+    h('p', { class: 'muted' }, `The split copies every block the lab shares with ${lab.template}, so it needs that much free space (checked before it starts) and can take a while. The template starts with ${lab.template}'s description, diagram and RDP login; users need access granted on the Users page.`)),
+  [h('button', { class: 'btn', onclick: () => d.close() }, 'Cancel'), h('button', { class: 'btn primary', onclick: submit }, 'Split clone')]);
+  f.input.focus(); f.input.select();
 }
 
 let usersCache = null;
@@ -389,11 +450,6 @@ async function viewTemplate(name) {
   if (!t) { render(errorBox('Template not found.')); return; }
   const jobs = await api(`/api/jobs?target=${encodeURIComponent(name)}&limit=20`);
   const running = t.status === 'Started';
-  const rows = t.vms.map((vm) => h('tr', {},
-    h('td', {}, h('div', { class: 'lab-name' }, vm.name), vm.os ? h('div', { class: 'lab-sub' }, vm.os) : null),
-    h('td', {}, statusPill(vm.power === 'PoweredOn' ? 'Started' : 'Stopped')),
-    h('td', { class: 'mono' }, vm.ip || '—'),
-    h('td', {}, `${vm.cpu} vCPU · ${vm.memGB} GB`)));
   render(
     pageHead(t.name, t.description || 'Catalog template', running ? connectButton(t, false, true) : null, templateMenu(t)),
     inventoryNotice(inv),
@@ -402,14 +458,23 @@ async function viewTemplate(name) {
       h('div', { class: 'card tile' }, h('div', { class: 'label' }, 'Gateway (WAN)'), h('div', { class: 'value mono', style: 'font-size:20px' }, t.gatewayIp || '—')),
       h('div', { class: 'card tile' }, h('div', { class: 'label' }, 'Virtual machines'), h('div', { class: 'value' }, String(t.vms.length))),
       h('div', { class: 'card tile' }, h('div', { class: 'label' }, 'Volume size'), h('div', { class: 'value' }, t.sizeGB != null ? `${t.sizeGB} GB` : '—'))),
-    h('div', { class: 'section' }, h('h2', {}, 'Virtual machines'),
-      t.vms.length ? h('div', { class: 'card table-wrap' }, h('table', {},
-        h('thead', {}, h('tr', {}, h('th', {}, 'VM'), h('th', {}, 'Power'), h('th', {}, 'IP address'), h('th', {}, 'Size'))),
-        h('tbody', {}, rows)))
-        : h('div', { class: 'card empty' }, h('p', {}, t.status === 'Disabled' ? 'This template is not enabled in vCenter. Use Manage → Enable to import its VMs.' : 'No VMs found.'))),
+    vmSection(t.vms, t.status === 'Disabled' ? 'This template is not enabled in vCenter. Use Manage → Enable to import its VMs.' : 'No VMs found.'),
     t.hasDiagram ? h('div', { class: 'section card', style: 'overflow:hidden' }, h('img', { src: `/api/diagram/${encodeURIComponent(t.name)}`, alt: 'Lab topology', style: 'width:100%;display:block' })) : null,
     h('div', { class: 'section' }, h('h2', {}, 'History'), jobsTable(jobs)));
   every(10000, () => { if (location.hash === `#/catalog/${encodeURIComponent(name)}` || location.hash === `#/catalog/${name}`) softRefresh(() => viewTemplate(name)); });
+}
+
+// the VMs inside a template or lab copy, with their power state, address and size
+function vmSection(vms, emptyText) {
+  return h('div', { class: 'section' }, h('h2', {}, 'Virtual machines'),
+    vms.length ? h('div', { class: 'card table-wrap' }, h('table', {},
+      h('thead', {}, h('tr', {}, h('th', {}, 'VM'), h('th', {}, 'Power'), h('th', {}, 'IP address'), h('th', {}, 'Size'))),
+      h('tbody', {}, vms.map((vm) => h('tr', {},
+        h('td', {}, h('div', { class: 'lab-name' }, vm.name), vm.os ? h('div', { class: 'lab-sub' }, vm.os) : null),
+        h('td', {}, statusPill(vm.power === 'PoweredOn' ? 'Started' : 'Stopped')),
+        h('td', { class: 'mono' }, vm.ip || '—'),
+        h('td', {}, `${vm.cpu} vCPU · ${vm.memGB} GB`))))))
+      : h('div', { class: 'card empty' }, h('p', {}, emptyText)));
 }
 
 function uploadDiagram(t) {
@@ -461,7 +526,7 @@ async function viewLab(name) {
   if (!lab) { render(errorBox('Lab not found, or you do not have access to it.')); return; }
   const jobs = await api(`/api/jobs?target=${encodeURIComponent(name)}&limit=20`);
   render(
-    pageHead(lab.name, lab.description || `Copy of ${lab.template}`, ...labButtons(lab, false)),
+    pageHead(lab.name, lab.description || `Copy of ${lab.template}`, ...labButtons(lab, false), isAdmin() ? labMenu(lab) : null),
     inventoryNotice(inv),
     h('div', { class: 'tiles' },
       h('div', { class: 'card tile' }, h('div', { class: 'label' }, 'Status'), h('div', { style: 'margin-top:8px' }, statusPill(lab.status, lab.job))),
@@ -469,6 +534,7 @@ async function viewLab(name) {
       h('div', { class: 'card tile' }, h('div', { class: 'label' }, 'Virtual machines'), h('div', { class: 'value' }, String(lab.vmCount || 0))),
       h('div', { class: 'card tile' }, h('div', { class: 'label' }, 'Template'), h('div', { class: 'value', style: 'font-size:18px' }, lab.template),
         isAdmin() ? h('div', { class: 'sub' }, lab.owner ? `owner: ${lab.owner.username}` : 'unassigned') : null)),
+    vmSection(lab.vms || [], lab.status === 'Provisioning' ? 'The VMs appear once provisioning finishes.' : 'No VMs found.'),
     snapshotsSection(lab),
     lab.hasDiagram ? h('div', { class: 'section card', style: 'overflow:hidden' }, h('img', { src: `/api/diagram/${encodeURIComponent(lab.template)}`, alt: 'Lab topology', style: 'width:100%;display:block' })) : null,
     h('div', { class: 'section' }, h('h2', {}, 'History'), jobsTable(jobs)));
@@ -537,8 +603,8 @@ async function deleteSnapshot(lab, snap) {
   } catch (e) { toast(e.message, true); }
 }
 
-function jobsTable(jobs) {
-  if (!jobs.length) return h('div', { class: 'card empty' }, 'Nothing yet.');
+function jobsTable(jobs, emptyText) {
+  if (!jobs.length) return h('div', { class: 'card empty' }, emptyText || 'Nothing yet.');
   return h('div', { class: 'card table-wrap' }, h('table', {},
     h('thead', {}, h('tr', {}, h('th', {}, '#'), h('th', {}, 'Action'), h('th', {}, 'Lab'), h('th', {}, 'Status'), isAdmin() ? h('th', {}, 'By') : null, h('th', {}, 'When'))),
     h('tbody', {}, jobs.map((j) => h('tr', {},
@@ -567,7 +633,11 @@ async function viewJob(id) {
       `Job #${j.id}${j.username ? ` by ${j.username}` : ''} · started ${when(j.started_at || j.created_at)}`,
       jobPill(j.status), templates.has(j.target)
         ? h('a', { class: 'btn', href: `#/catalog/${encodeURIComponent(j.target)}` }, 'Open template')
-        : h('a', { class: 'btn', href: `#/labs/${encodeURIComponent(j.target)}` }, 'Open lab')));
+        : h('a', { class: 'btn', href: `#/labs/${encodeURIComponent(j.target)}` }, 'Open lab'),
+      // a finished rename / split links to what it produced
+      j.status === 'succeeded' && j.newName ? h('a', { class: 'btn primary', href: j.action === 'lab-split'
+        ? `#/catalog/${encodeURIComponent(j.newName)}` : `#/labs/${encodeURIComponent(j.newName)}` },
+      j.action === 'lab-split' ? 'Open new template' : 'Open renamed lab') : null));
     const atBottom = pre.scrollTop + pre.clientHeight >= pre.scrollHeight - 20;
     pre.textContent = j.log || '(waiting to start…)';
     if (atBottom) pre.scrollTop = pre.scrollHeight;
