@@ -21,14 +21,15 @@ vLab 2.0 is the successor to [madlabber/vlab](https://github.com/madlabber/vlab)
 6. [Step 3 – First sign-in and adding users](#step-3--first-sign-in-and-adding-users)
 7. [Using the portal](#using-the-portal)
 8. [Lab snapshots and restore](#lab-snapshots-and-restore)
-9. [Lab templates](#lab-templates)
-10. [Retiring vlab 1.x (brownfield)](#retiring-vlab-1x-brownfield)
-11. [Configuration reference](#configuration-reference)
-12. [Update, backup, uninstall](#update-backup-uninstall)
-13. [Security notes](#security-notes)
-14. [Troubleshooting](#troubleshooting)
-15. [Known limitations](#known-limitations)
-16. [Credits](#credits)
+9. [Rename and split clone (admins)](#rename-and-split-clone-admins)
+10. [Lab templates](#lab-templates)
+11. [Retiring vlab 1.x (brownfield)](#retiring-vlab-1x-brownfield)
+12. [Configuration reference](#configuration-reference)
+13. [Update, backup, uninstall](#update-backup-uninstall)
+14. [Security notes](#security-notes)
+15. [Troubleshooting](#troubleshooting)
+16. [Known limitations](#known-limitations)
+17. [Credits](#credits)
 
 ---
 
@@ -166,7 +167,7 @@ Run the installer **as the account that runs vlab 1.x**, so it can read vlab's s
    | `newID`, `autostart` | `labs.firstId`, `labs.autostart` |
    | `rdpdomain`, `rdpuser`, `rdppassword` | `rdp.domain`, `.user`, `.password` |
 2. Copies `vicred.clixml` and `nccred.clixml` into `data\`. If another Windows account saved them, it asks for the credentials instead.
-3. Copies `cmdb\descriptions.tbl`, `cmdb\*.jpg|png` and `cmdb\*.conf` into `catalog\`.
+3. Copies `cmdb\descriptions.tbl`, `cmdb\*.jpg|png` and `cmdb\*.conf` into `catalog\`. After that, `.conf` files are also read straight from `C:\vlab\cmdb` (`legacyCmdbDir`), so one added there later is used too.
 4. Tests the vCenter and ONTAP connections and reports how many lab volumes it sees.
 5. Installs Node.js 24, opens the firewall, and asks for your Windows password to register the boot task.
 
@@ -189,7 +190,7 @@ The installer asks for:
 | NFS datastore | `LABs` | lab volumes are junctioned at `/LABs/lab_*`, and that path is mounted in vSphere as this datastore |
 | First copy number | `1000` | copies are named `lab_x_1001`, `lab_x_1002`, … |
 | Autostart | `false` | power copies on right after provisioning |
-| RDP domain, user, password | `lab`, `administrator`, … | default jumphost login for **Connect**; override per template in `catalog\<template>.conf` |
+| RDP domain, user, password | `lab`, `administrator`, … | default jumphost login for **Connect**; override per lab with a `.conf` file (see [Lab templates](#lab-templates)) |
 
 It then installs **VCF.PowerCLI** and **NetApp.ONTAP** if they're missing (a few minutes), asks for the **vCenter** and **ONTAP** credentials, tests both connections, and finishes as for brownfield.
 
@@ -215,12 +216,13 @@ Next, add lab templates (see [Lab templates](#lab-templates)). The catalog stays
   * **Start** powers on the copy.
   * **Connect** opens the jumphost desktop in a new tab. It appears once the lab is running and the gateway has an IP.
   * **Shut down** shuts down the guest OSes; **Power off** is a hard stop.
-  * **Snapshots** opens the lab page, where you take snapshots and restore them (see the next section).
+  * **Snapshots** opens the lab page: its VMs (power state, IP, guest OS, vCPU/RAM), snapshots (see the next section), diagram and job history.
   * **Destroy** deletes the copy's VMs, VLANs and volume. You must type the lab name to confirm.
-* **Activity** shows your jobs and their logs.
+* **Dashboard**: your labs, cluster capacity, and **Recent activity** from the last 8 hours (plus any job still running).
+* **Activity** shows all your jobs and their logs.
 
 **Admins**, in addition:
-* **All labs**: every copy, with an owner drop-down to reassign copies.
+* **All labs**: every copy, with an owner drop-down to reassign copies and a **Manage…** menu (also on each copy's page) with **Rename…** and **Split clone to new template…** (see [Rename and split clone](#rename-and-split-clone-admins)).
 * **Catalog → Manage…** on each template:
 
   | Item | What it does |
@@ -234,7 +236,7 @@ Next, add lab templates (see [Lab templates](#lab-templates)). The catalog stays
 * **Catalog → template name** opens the template's page: status, gateway IP, its VMs (power state, IP, guest OS, vCPU/RAM), diagram and job history. While the template is running, **Connect** (on the card and the page) opens its jumphost desktop, e.g. to update the template.
 * **Settings**: rename the portal (top-left, browser tab and sign-in page). Takes effect at once; blank goes back to `site.name` from `config.json`.
 * **Refresh status** re-reads vCenter and ONTAP now instead of within 60 seconds.
-* **Audit log**: every sign-in, failed sign-in, provision, power action, snapshot, restore, connect and user change, with the source IP.
+* **Audit log**: every sign-in, failed sign-in, provision, power action, snapshot, restore, rename, split clone, connect and user change, with the source IP.
 
 ## Lab snapshots and restore
 
@@ -255,6 +257,28 @@ Every lab copy has a **Snapshots** section on its page.
 
 Restoring needs the **SnapRestore** licence (part of ONTAP One).
 
+## Rename and split clone (admins)
+
+Both are on the **Manage…** menu of a lab copy (**All labs** or the copy's page). Only admins see the menu, and the server refuses both actions for anyone else. Each runs as a job with a live log; the job page links to the result when it finishes.
+
+**Rename…** gives a copy a new name everywhere, like vlab 1.x's `rename-vlab.ps1`:
+1. Powers the copy off (it stays off) and unregisters its VMs. Their files stay on the volume.
+2. Renames its port groups in place, keeping their VLANs. A copy with private vSwitches (trunked templates) gets new vSwitches with the same MTU, security settings and port groups, and the old ones are removed.
+3. Renames the ONTAP volume, its junction (the datastore folder) and the vApp.
+4. Re-registers the VMs and reconnects their NICs and serial pipes to the new names.
+
+The owner, snapshots and **Reset to original** are kept. The portal remembers the copy's earlier names, so restoring a snapshot taken before the rename reconnects that snapshot's old networks too. A rename takes a few minutes.
+
+**Split clone to new template…** makes an independent copy of a lab and publishes it in the **Catalog**. The source copy is not changed.
+1. Snapshots the source copy and makes a FlexClone of it under the new name.
+2. Checks the split's space estimate against the aggregate's free space, and stops (removing the clone) if it doesn't fit.
+3. Splits the clone in ONTAP (`volume clone split`), so it no longer depends on the source or the template. This copies every shared block, so it takes a while for big labs; the job log shows progress.
+4. Creates the new template's vApp, its own networks (new VLANs, or private vSwitches for trunked labs), registers and reconnects its VMs, and takes its `master` snapshot.
+
+The new template appears in the Catalog only when the job has finished. It starts with the source's description (with "split from …" added), diagram and RDP login (`.conf`). Grant users access to it on the **Users** page. If the source lab is running, the template is crash-consistent; shut the lab down first for a clean one.
+
+**Names**: `lab_` then letters, digits, dot, dash or underscore. Because networks are matched by name prefix, a new name can't be the start of another lab's name (`lab_demo` when `lab_demo_v2` exists) or start with the name of a lab copy (`lab_x_1001_v2`).
+
 ## Lab templates
 
 A template is anything the engine can clone. Labs built with [LabBuilder](https://github.com/madlabber/LabBuilder) and vlab 1.x templates work as they are. By hand, a template is:
@@ -265,9 +289,21 @@ A template is anything the engine can clone. Labs built with [LabBuilder](https:
 4. Port groups `lab_<name>_net1`, `_net2`, … for the lab's internal networks. Copies get their own `lab_<name>_<n>_net1`, … on free VLANs.
 5. A VM whose name contains `gateway`. Its first network card that isn't on a lab network is connected to the WAN port group, and its first IP is used for **Connect**.
 6. Optional: a `master` snapshot. Copies are cloned from it; without one, the engine snapshots the template at provision time.
-7. Optional: `catalog\lab_<name>.jpg` or `.png` (picture), a line in `catalog\descriptions.tbl` (text) and `catalog\lab_<name>.conf` (`rdpdomain=`, `rdpuser=`, `rdppassword=` overrides).
+7. Optional: `catalog\lab_<name>.jpg` or `.png` (picture), a line in `catalog\descriptions.tbl` (text) and `lab_<name>.conf` (RDP login, below).
 
 Templates whose internal networks are trunk (VLAN 4095) port groups get private vSwitches per copy, as in vlab 1.x.
+
+**RDP login per lab (`.conf`)**: a file named after a lab, with any of these lines:
+```
+rdpdomain=lab
+rdpuser=administrator
+rdppassword=...
+```
+**Connect** uses the first file it finds, in this order:
+1. the lab's own name (`lab_x_1001.conf`, for one copy only), then its template's (`lab_x.conf`, for every copy);
+2. in `catalog\` first, then in vlab 1.x's `C:\vlab\cmdb` (`legacyCmdbDir`).
+
+Keys missing from the file fall back to `rdp.*` in `config.json`. A key that is present but blank stays blank, as in vlab 1.x: `rdpdomain=` means a local account, not the default domain. Files are read at each Connect, so no restart is needed.
 
 ## Retiring vlab 1.x (brownfield)
 
@@ -293,6 +329,7 @@ Once everyone uses the new portal:
 | `labs.firstId`, `.autostart` | `1000`, `false` | copy numbering; power on after provisioning |
 | `labs.maxSnapshotsPerLab` | `5` | user snapshots per copy (the original is extra) |
 | `rdp.domain`, `.user`, `.password` | | default jumphost login for Connect |
+| `legacyCmdbDir` | `C:\vlab\cmdb` | vlab 1.x folder also searched for `<lab>.conf` RDP logins; `""` turns this off |
 | `guacamole.url`, `.jsonSecretKey` | | empty turns **Connect** off |
 
 Credentials are kept in `data\vcenter.cred.xml` and `data\ontap.cred.xml` (PowerShell `Export-Clixml`, encrypted for the portal account). To change one, delete the file and re-run `.\install.ps1`.
@@ -313,7 +350,7 @@ Stop-ScheduledTask 'vLab Portal'; Start-ScheduledTask 'vLab Portal'
 
 * **Accounts and sessions**: passwords are stored as scrypt hashes. Sessions are random 256-bit tokens stored only as hashes, valid for 12 hours. After 5 failed sign-ins a username is locked for 15 minutes from that IP.
 * **Requests**: state-changing requests must carry the portal's own header, cookies are `SameSite=Strict`, and a strict Content-Security-Policy applies.
-* **Engine**: every action maps to one engine action with validated lab and snapshot names. Destroy and snapshot actions refuse anything that isn't a FlexClone copy, so templates can't be destroyed or rolled back by a user.
+* **Engine**: every action maps to one engine action with validated lab and snapshot names. Destroy and snapshot actions refuse anything that isn't a FlexClone copy, so templates can't be destroyed or rolled back by a user. Rename and split clone are admin-only, checked on the server.
 * **HTTP only**: the portal serves plain HTTP. Beyond a trusted lab network, put it behind a TLS reverse proxy and set `secureCookies: true`. Do the same for Guacamole.
 * **Stored secrets**: the default jumphost RDP password is stored in `config.json`, which is ACL-protected. The Guacamole JSON key works like a master key for lab desktops, so keep `config.json` and `~/guacamole/guacamole.env` private.
 
@@ -331,7 +368,10 @@ Stop-ScheduledTask 'vLab Portal'; Start-ScheduledTask 'vLab Portal'
 | Restore fails "Snapshot … not found" | it was already removed, either deleted or by restoring an older snapshot. Refresh the page |
 | A copy's VMs show up outside their vApp in vCenter | run a restore or a provision; the engine moves them back. Destroy also finds them by their folder |
 | **Connect** is greyed out | the lab isn't running, its gateway has no IP yet (wait for VMware Tools), or Guacamole isn't configured |
-| Connect opens but can't reach the desktop | from the Guacamole host, `nc -vz <gateway-wan-ip> 3389` must work. Check the gateway's NAT rule and the RDP login (`rdp.*` in config.json, `catalog\<template>.conf`) |
+| Connect opens but can't reach the desktop | from the Guacamole host, `nc -vz <gateway-wan-ip> 3389` must work. Check the gateway's NAT rule and the RDP login (`rdp.*` in config.json, or the lab's `.conf`; see [Lab templates](#lab-templates)) |
+| Rename or split clone refuses the name | it exists already, is the start of another lab's name, or starts with a lab copy's name (see [Names](#rename-and-split-clone-admins)) |
+| Split clone stops with "Not enough space" | the aggregate can't hold the split; free space or choose a smaller lab |
+| Deleting a volume or snapshot in ONTAP fails with "has one or more clones" or "busy", after a Destroy | ONTAP keeps destroyed volumes in its **recovery queue** for 12 hours, and they still hold their parent. Wait, or as `set -privilege advanced`: `volume recovery-queue show -vserver <svm>`, then `volume recovery-queue purge -vserver <svm> -volume <name>` for the destroyed copy (purged volumes can't be recovered) |
 | Forgot the admin password | another admin can reset it. Otherwise: stop the task, delete `data\portal.db` (users and history are lost; labs and credentials are not), start the task, and use the new `initial-admin-password.txt` |
 
 Logs: `logs\portal.log` (server), each job's log on **Activity**, and `podman logs guacamole-web` / `podman logs guacd` on the Guacamole host.
@@ -342,7 +382,9 @@ Logs: `logs\portal.log` (server), each job's log on **Activity**, and `podman lo
 * Standard vSwitches only (no distributed switches) and NFS datastores.
 * Status can lag reality by up to `inventoryIntervalSec`. Admins can use **Refresh status**.
 * Copy names are reused after a copy is destroyed (`lab_x_1001` again). The engine removes stale port groups with that name first.
-* The trunked-port-group (private vSwitch) path is ported from vlab 1.x but has not been tested on a live system yet.
+* Lab names must be `lab_` followed by a letter or digit. A vlab 1.x lab such as `lab__ThePenthouse` (two underscores) is ignored, along with its `.conf`, until its volume is renamed.
+* A destroyed copy stays in ONTAP's volume recovery queue for 12 hours, still using space and holding its template's snapshot (see [Troubleshooting](#troubleshooting)).
+* There is no **Delete template** in the portal; a template (including one made by split clone) is removed in vCenter and ONTAP.
 * vlab 1.x's "authoring mode" (mount and unmount) is replaced by starting the template itself: edit it, then take a **New master snapshot**.
 
 ## Credits
